@@ -36,8 +36,8 @@ func TestModelEntriesAliasesStaticAndBenefit(t *testing.T) {
 		t.Error("福利模型应在 /v1/models 标记 benefit")
 	}
 
-	// 动态目录缺失的模型由静态表补位（精确 ID + 小写别名），福利标记跟随静态表。
-	for _, want := range []string{"Qwen3-VL-235B", "qwen3-vl-235b", "glm-5.3-flash", "deepseek-v4-flash-0731"} {
+	// 动态目录缺失的模型由静态表补位（精确 ID + 小写别名），2026-10 架构下静态表全为积分计费（无 benefit）。
+	for _, want := range []string{"Qwen3-VL-235B", "qwen3-vl-235b", "glm-5.3-flash", "glm-5.3", "openpangu-2.0-pro"} {
 		if byID[want] == nil {
 			t.Errorf("静态兜底缺少 %q", want)
 		}
@@ -45,8 +45,8 @@ func TestModelEntriesAliasesStaticAndBenefit(t *testing.T) {
 	if byID["qwen3-vl-235b"]["benefit"] != nil {
 		t.Error("内置模型不应标记 benefit")
 	}
-	if byID["glm-5.3-flash"]["benefit"] != true {
-		t.Error("静态兜底里的福利模型应保留 benefit 标记")
+	if byID["glm-5.3-flash"]["benefit"] != nil {
+		t.Error("2026-10 架构下 glm-5.3-flash 走积分计费，不应标记 benefit")
 	}
 
 	// 动态目录整体失败（无账号可用）时仍返回完整静态表 + 别名。

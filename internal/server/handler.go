@@ -67,19 +67,25 @@ type staticModel struct {
 // staticModels 静态兜底表：**只放实测确认可用的模型**。
 //
 // 上游的模型发现（agent-center / builtin）会列出当前账号未注册的模型，静态表
-// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-09-15 真实账号
-// 逐个调用验证（见 docs/reverse-engineering.md §7）：
+// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-10 实测验证
+// （12 款可用模型严格遵循上游 /api/v2/chat/completions 真实大小写定义）：
 //
-//	✅ GLM-5.2、glm-5.2-sft-harmony、Qwen3-VL-235B
-//	❌ GLM-5.2-ArkTS-SPARK、OpenPangu-2.0-Pro、OpenPangu-2.0-Flash（002002009.404）
+//	✅ glm-5.3、glm-5.3-flash、kimi-k3、kimi-k3.1-pro、openpangu-2.0-pro、
+//	   openpangu-2.0-flash、deepseek-v4.1-flash、deepseek-v4.1-flash-1017、
+//	   GLM-5.2、glm-5.2-sft-harmony、kimi-k2.6-vl、Qwen3-VL-235B
 var staticModels = []staticModel{
+	{ID: "glm-5.3", ContextWindow: 131072},
+	{ID: "glm-5.3-flash", ContextWindow: 131072},
+	{ID: "kimi-k3", ContextWindow: 131072},
+	{ID: "kimi-k3.1-pro", ContextWindow: 131072},
+	{ID: "openpangu-2.0-pro", ContextWindow: 131072},
+	{ID: "openpangu-2.0-flash", ContextWindow: 131072},
+	{ID: "deepseek-v4.1-flash", ContextWindow: 131072},
+	{ID: "deepseek-v4.1-flash-1017", ContextWindow: 131072},
 	{ID: "GLM-5.2", ContextWindow: 202752},
 	{ID: "glm-5.2-sft-harmony", ContextWindow: 131072},
+	{ID: "kimi-k2.6-vl", ContextWindow: 131072},
 	{ID: "Qwen3-VL-235B", ContextWindow: 131072},
-	// 限时福利（需领取；领取后实测可用，聊天自动带 maas_type: benefit）
-	{ID: "deepseek-v4-flash-0731", ContextWindow: 1048576, Benefit: true},
-	{ID: "deepseek-v4-pro-0813", ContextWindow: 1048576, Benefit: true},
-	{ID: "glm-5.3-flash", ContextWindow: 1048576, Benefit: true},
 }
 
 const (
@@ -754,6 +760,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			break // 非并发错误，跳出重试
+		}
+		if serr != nil {
+			// 若上游返回 4004.200 (benefit not found) 且带了福利头：2026-10 架构下线了福利网关，
+			// 去掉 maas_type: benefit 立即在当前账号重试一次。
+			if benefit && (strings.Contains(serr.Error(), "4004.200") || strings.Contains(serr.Error(), "benefit not found")) {
+				log.Printf("upstream benefit not found for model %s account=%s: retrying without benefit header", model, acct.Name)
+				benefit = false
+				rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, false)
+			}
 		}
 		if serr != nil {
 			release() // 释放槽位再换号

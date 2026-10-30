@@ -183,7 +183,7 @@ func TestChatCompletionsRetriesEmbeddedCodeArtsQueueLimit(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsSignsBenefitHeaderForGLM53Flash(t *testing.T) {
+func TestChatCompletionsDoesNotSignBenefitHeaderForGLM53Flash(t *testing.T) {
 	headersSeen := make(chan http.Header, 1)
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		headersSeen <- r.Header.Clone()
@@ -194,7 +194,7 @@ func TestChatCompletionsSignsBenefitHeaderForGLM53Flash(t *testing.T) {
 	}))
 	defer upstreamServer.Close()
 
-	a := auth.New("benefit-account", "tester", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	a := auth.New("credit-account", "tester", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
 	p, err := pool.New([]*auth.Auth{a}, pool.Config{MaxConcurrent: 1}, "")
 	if err != nil {
 		t.Fatal(err)
@@ -212,12 +212,12 @@ func TestChatCompletionsSignsBenefitHeaderForGLM53Flash(t *testing.T) {
 	}
 
 	headers := <-headersSeen
-	if got := headers.Get("maas_type"); got != "benefit" {
-		t.Fatalf("maas_type=%q, want benefit", got)
+	if got := headers.Get("maas_type"); got != "" {
+		t.Fatalf("2026-10 架构下 glm-5.3-flash 不得带 maas_type: benefit（否则触发 4004.200），got=%q", got)
 	}
 	authorization := headers.Get("Authorization")
-	if !strings.Contains(authorization, "SignedHeaders=") || !strings.Contains(authorization, "maas_type") {
-		t.Fatalf("maas_type was not covered by the Huawei signature: %q", authorization)
+	if strings.Contains(authorization, "maas_type") {
+		t.Fatalf("maas_type 不应出现在华为云签名中: %q", authorization)
 	}
 }
 
@@ -244,7 +244,7 @@ func TestModelsAdvertisesOnlyVerifiedNewCodeArtsModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 静态兜底只列实测确认可用的模型；未注册的（GLM-5.2-ArkTS-SPARK /
-	// OpenPangu-2.0-Pro/Flash）不得出现，否则等于把 404 写进兜底路径。
+	// OpenPangu-2.0-Pro/Flash 大写别名）不得出现，否则等于把 404 写进兜底路径。
 	for _, bad := range []string{"GLM-5.2-ArkTS-SPARK", "OpenPangu-2.0-Pro", "OpenPangu-2.0-Flash"} {
 		for _, model := range payload.Data {
 			if model.ID == bad {
@@ -252,7 +252,7 @@ func TestModelsAdvertisesOnlyVerifiedNewCodeArtsModels(t *testing.T) {
 			}
 		}
 	}
-	want := map[string]int{"deepseek-v4-pro-0813": 1048576, "GLM-5.2": 202752}
+	want := map[string]int{"glm-5.3": 131072, "GLM-5.2": 202752}
 	for _, model := range payload.Data {
 		if expected, ok := want[model.ID]; ok {
 			if model.ContextLength != expected {

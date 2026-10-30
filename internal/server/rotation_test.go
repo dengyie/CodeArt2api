@@ -96,3 +96,41 @@ func rotationPool(t *testing.T, endpoint string) *pool.Pool {
 	}
 	return p
 }
+
+// 若账号携带了福利标记导致上游返回 4004.200 benefit not found，
+// 应自动摘除福利头重试并成功。
+func TestChatCompletionsRecoversFromBenefitNotFound(t *testing.T) {
+	var attempts int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Header.Get("maas_type") == "benefit" {
+			_, _ = io.WriteString(w, "data: {\"text\":\"[DONE]\",\"error_code\":\"InferHub.4004.200\",\"error_msg\":\"benefit not found\"}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer backend.Close()
+
+	a := auth.New("acct-benefit", "a", "domain", "tok-a", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Accounts()[0].Client = upstream.NewWithChatEndpoint(5*time.Second, backend.URL)
+	// 在该账号目录中故意标记为福利模型
+	upstream.SetAccountModels("acct-benefit", []upstream.ModelInfo{{ID: "glm-5.3", Benefit: true}})
+
+	h := NewHandler(Config{Pool: p, DefaultModel: "glm-5.3", MaxRotate: 1})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if attempts != 2 {
+		t.Fatalf("应在同账号上自动摘除福利头重试，attempts=%d, want 2", attempts)
+	}
+}

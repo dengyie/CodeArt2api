@@ -16,17 +16,55 @@ import (
 func TestCanonicalModelKnownIndex(t *testing.T) {
 	SetAccountModels("t-canon", []ModelInfo{{ID: "Qwen3.9-Test-VL", ContextWindow: 4096}})
 	tests := []struct{ in, want string }{
-		{"Qwen3.9-Test-VL", "Qwen3.9-Test-VL"},           // 精确命中
-		{"qwen3.9-test-vl", "Qwen3.9-Test-VL"},           // 小写别名归一
-		{"glm-5.2", "GLM-5.2"},                           // 种子 + 静态别名
-		{"snap-chat", "GLM-5.2"},                         // 旧版别名
-		{"deepseek-v4-pro-0813", "deepseek-v4-pro-0813"}, // 福利种子（全小写）
-		{"unknown-model-xyz", "unknown-model-xyz"},       // 未知原样透传
+		{"Qwen3.9-Test-VL", "Qwen3.9-Test-VL"},         // 精确命中
+		{"qwen3.9-test-vl", "Qwen3.9-Test-VL"},         // 小写别名归一
+		{"glm-5.2", "GLM-5.2"},                         // 种子 + 静态别名
+		{"snap-chat", "GLM-5.2"},                       // 旧版别名
+		{"glm-5.3", "glm-5.3"},                         // 实测验证（全小写）
+		{"GLM-5.3", "glm-5.3"},                         // 大写归一为实测小写
+		{"OpenPangu-2.0-Pro", "openpangu-2.0-pro"},     // 大写归一为实测小写
+		{"openpangu-2.0-pro", "openpangu-2.0-pro"},     // 精确命中
+		{"Qwen3-VL-235B", "Qwen3-VL-235B"},             // 精确命中实测大写
+		{"qwen3-vl-235b", "Qwen3-VL-235B"},             // 小写归一为实测大写
+		{"deepseek-v4.1-flash", "deepseek-v4.1-flash"}, // 实测验证全小写
+		{"DeepSeek-V4.1-Flash", "deepseek-v4.1-flash"}, // 大写归一为实测小写
+		{"unknown-model-xyz", "unknown-model-xyz"},     // 未知原样透传
 	}
 	for _, tc := range tests {
 		if got := CanonicalModel(tc.in); got != tc.want {
 			t.Errorf("CanonicalModel(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestRecordWorkingModelOverridesAndLearns(t *testing.T) {
+	RecordWorkingModel("dynamic-model-x", "Dynamic-Model-X")
+	if got := CanonicalModel("dynamic-model-x"); got != "Dynamic-Model-X" {
+		t.Errorf("CanonicalModel(dynamic-model-x) = %q, want Dynamic-Model-X", got)
+	}
+	if got := CanonicalModel("DYNAMIC-MODEL-X"); got != "Dynamic-Model-X" {
+		t.Errorf("CanonicalModel(DYNAMIC-MODEL-X) = %q, want Dynamic-Model-X", got)
+	}
+}
+
+func TestAlternativeCases(t *testing.T) {
+	alts := AlternativeCases("GLM-5.3")
+	if len(alts) == 0 || alts[0] != "glm-5.3" {
+		t.Errorf("AlternativeCases(GLM-5.3) 首个备选应为实测验证大小写 glm-5.3, got=%v", alts)
+	}
+
+	alts2 := AlternativeCases("custom-foo-bar")
+	foundLower := false
+	for _, a := range alts2 {
+		if a == "custom-foo-bar" {
+			t.Errorf("AlternativeCases 不得包含输入自身: %v", alts2)
+		}
+		if a == "CUSTOM-FOO-BAR" {
+			foundLower = true
+		}
+	}
+	if !foundLower {
+		t.Errorf("AlternativeCases 应包含大写变体: %v", alts2)
 	}
 }
 
@@ -46,12 +84,12 @@ func TestBenefitIsPerAccount(t *testing.T) {
 	if IsBenefitModel("acct-b", "glm-5.2") {
 		t.Error("内置模型不应走福利路由")
 	}
-	// 目录未知的账号：回退冷启动种子（宁可带头，避免未注册模型 404）。
-	if !IsBenefitModel("acct-unknown", "glm-5.3-flash") {
-		t.Error("目录未发现时应回退种子判定福利模型")
+	// 2026-10 架构升级后福利种子清空，未发现的账号不走福利路由，避免 4004.200。
+	if IsBenefitModel("acct-unknown", "glm-5.3-flash") {
+		t.Error("未发现的账号不应走福利路由（避免误注入 maas_type 引发 4004.200）")
 	}
 	if IsBenefitModel("acct-unknown", "glm-5.2") {
-		t.Error("种子之外的模型不得误判为福利")
+		t.Error("内置模型不得误判为福利")
 	}
 }
 
@@ -89,10 +127,6 @@ func TestDiscoveredCatalogOverridesSeed(t *testing.T) {
 	}
 	if IsBenefitModel("acct-promoted", "GLM-5.2") {
 		t.Error("内置模型不应走福利路由")
-	}
-	// 目录里查不到的种子模型（福利来源失败/未领取）仍要带头，否则上游按未注册模型拒。
-	if !IsBenefitModel("acct-promoted", "deepseek-v4-pro-0813") {
-		t.Error("目录里没有的种子模型应回退种子判定")
 	}
 	// 目录明确标了福利 → 优先级最高。
 	SetAccountModels("acct-promoted2", []ModelInfo{{ID: "glm-5.3-flash", Benefit: true}})

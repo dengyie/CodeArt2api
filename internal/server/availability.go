@@ -202,6 +202,36 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 		if strings.Contains(err.Error(), "TM.00001041") {
 			return
 		}
+		// 模型未注册时可能是大小写不匹配，尝试备选大小写
+		if upstream.IsModelNotRegisteredError(err) {
+			for _, alt := range upstream.AlternativeCases(model) {
+				altBody := map[string]any{
+					"model":    upstream.CanonicalModel(alt),
+					"stream":   true,
+					"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+				}
+				altRC, altErr := acct.Client.SendChatV2(ctx, altBody, "", cred, cred.SecurityToken, false)
+				if altErr == nil {
+					br := bufio.NewReaderSize(altRC, 64*1024)
+					var altHead strings.Builder
+					for i := 0; i < 6; i++ {
+						line, lerr := br.ReadString('\n')
+						altHead.WriteString(line)
+						if lerr != nil {
+							break
+						}
+					}
+					altRC.Close()
+					if upstreamUnavailableReasonText(altHead.String()) == "" && altHead.Len() > 0 {
+						upstream.RecordWorkingModel(model, alt)
+						markUsable(acct.UID, model)
+						markUsable(acct.UID, alt)
+						log.Printf("probe %s/%s: 可用 (自适应备选大小写 %s 成功)", acct.Name, model, alt)
+						return
+					}
+				}
+			}
+		}
 		if reason := upstreamUnavailableReason(err); reason != "" {
 			markUnusable(acct.UID, model, reason)
 			log.Printf("probe %s/%s: 不可用：%s", acct.Name, model, reason)
@@ -223,6 +253,35 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	}
 	headStr := head.String()
 	if reason := upstreamUnavailableReasonText(headStr); reason != "" {
+		if strings.Contains(strings.ToLower(headStr), "002002009") || strings.Contains(strings.ToLower(headStr), "not registered") {
+			for _, alt := range upstream.AlternativeCases(model) {
+				altBody := map[string]any{
+					"model":    upstream.CanonicalModel(alt),
+					"stream":   true,
+					"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+				}
+				altRC, altErr := acct.Client.SendChatV2(ctx, altBody, "", cred, cred.SecurityToken, false)
+				if altErr == nil {
+					altBr := bufio.NewReaderSize(altRC, 64*1024)
+					var altHead strings.Builder
+					for i := 0; i < 6; i++ {
+						line, lerr := altBr.ReadString('\n')
+						altHead.WriteString(line)
+						if lerr != nil {
+							break
+						}
+					}
+					altRC.Close()
+					if upstreamUnavailableReasonText(altHead.String()) == "" && altHead.Len() > 0 {
+						upstream.RecordWorkingModel(model, alt)
+						markUsable(acct.UID, model)
+						markUsable(acct.UID, alt)
+						log.Printf("probe %s/%s: 可用 (自适应备选大小写 %s 成功)", acct.Name, model, alt)
+						return
+					}
+				}
+			}
+		}
 		markUnusable(acct.UID, model, reason)
 		log.Printf("probe %s/%s: 不可用：%s", acct.Name, model, reason)
 		return

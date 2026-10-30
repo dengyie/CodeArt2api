@@ -48,17 +48,19 @@ type ModelInfo struct {
 	Desc    string `json:"desc,omitempty"`
 }
 
-// 冷启动种子：福利套餐轮换后新增的模型在首次发现前也要走福利路由，
-// 少带一次头就是一次 404，宁可多带。发现结果只会在此基础上增补。
-var seedBenefitModels = []string{
-	"deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "glm-5.3-flash",
-}
+// 冷启动福利种子：华为云 2026-10 架构升级后下线了 opengw 福利网关，
+// 统一改为活动积分（Activity Credits）计费，聊天接口若追加 maas_type: benefit
+// 会被强制路由至已下线的福利网关并报错 InferHub.4004.200 benefit not found。
+// 因此冷启动福利种子保持为空，不再默认注入福利路由头。
+var seedBenefitModels []string
 
 // 内置模型种子（大小写归一用，不标记福利）。
 var seedKnownModels = []string{
-	"GLM-5.2", "GLM-5.2-ArkTS-SPARK", "GLM-5.1", "GLM-4.7",
-	"OpenPangu-2.0-Pro", "OpenPangu-2.0-Flash",
-	"Qwen3-VL-235B", "Qwen3.5-397B-A17B-VL", "Qwen3.6-27B-VL",
+	"glm-5.3", "glm-5.3-flash", "kimi-k3", "kimi-k3.1-pro",
+	"openpangu-2.0-pro", "openpangu-2.0-flash",
+	"deepseek-v4.1-flash", "deepseek-v4.1-flash-1017",
+	"GLM-5.2", "glm-5.2-sft-harmony", "kimi-k2.6-vl", "Qwen3-VL-235B",
+	"GLM-5.1", "GLM-4.7", "Qwen3.5-397B-A17B-VL", "Qwen3.6-27B-VL",
 }
 
 var seedBenefit = func() map[string]bool {
@@ -138,7 +140,9 @@ func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
 			ac.benefit[key] = true
 			ac.lastBenefit[key] = mi
 		}
-		if _, ok := catalog.known[key]; !ok || mi.ID != key {
+		if v, ok := verifiedModels[key]; ok {
+			catalog.known[key] = v
+		} else if _, ok := catalog.known[key]; !ok {
 			catalog.known[key] = mi.ID
 		}
 	}
@@ -151,7 +155,9 @@ func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
 			ac.benefit[key] = true
 			ac.knows[key] = true
 			ac.infos = append(ac.infos, mi)
-			if _, ok := catalog.known[key]; !ok || mi.ID != key {
+			if v, ok := verifiedModels[key]; ok {
+				catalog.known[key] = v
+			} else if _, ok := catalog.known[key]; !ok {
 				catalog.known[key] = mi.ID
 			}
 		}
@@ -278,12 +284,21 @@ func richerModel(cur, next ModelInfo) ModelInfo {
 	return keep
 }
 
-// betterModel 报告 a 是否比 b 更值得保留：优先带参数，其次保留精确大小写。
+// betterModel 报告 a 是否比 b 更值得保留：优先带参数，其次优先匹配实测验证大小写，再次优先保留全小写。
 func betterModel(a, b ModelInfo) bool {
 	if (a.ContextWindow > 0) != (b.ContextWindow > 0) {
 		return a.ContextWindow > 0
 	}
-	return a.ID != strings.ToLower(a.ID) && b.ID == strings.ToLower(b.ID)
+	keyA := strings.ToLower(a.ID)
+	if verified, ok := verifiedModels[keyA]; ok {
+		if a.ID == verified && b.ID != verified {
+			return true
+		}
+		if b.ID == verified && a.ID != verified {
+			return false
+		}
+	}
+	return a.ID == strings.ToLower(a.ID) && b.ID != strings.ToLower(b.ID)
 }
 
 // FetchModels 拉取指定账号当前可用模型（三路合并），并写入该账号的模型目录。

@@ -411,31 +411,132 @@ type ChatOptions struct {
 	ToolChoice      any
 }
 
+// verifiedModels 是上游 /api/v2/chat/completions 实测支持的精确模型大小写映射。
+// 上游按严格大小写匹配：部分模型必须全小写（如 glm-5.3、openpangu-2.0-pro），
+// 部分模型必须大写（如 GLM-5.2、Qwen3-VL-235B）。
+// 作为最高优先级静态索引，防止被 /v1/model/builtin 返回的大写展示名污染。
+var verifiedModels = map[string]string{
+	// 必须全小写的模型
+	"glm-5.3":                  "glm-5.3",
+	"glm-5.3-flash":            "glm-5.3-flash",
+	"kimi-k3":                  "kimi-k3",
+	"kimi-k3.1-pro":            "kimi-k3.1-pro",
+	"openpangu-2.0-pro":        "openpangu-2.0-pro",
+	"openpangu-2.0-flash":      "openpangu-2.0-flash",
+	"deepseek-v4.1-flash":      "deepseek-v4.1-flash",
+	"deepseek-v4.1-flash-1017": "deepseek-v4.1-flash-1017",
+	"glm-5.2-sft-harmony":      "glm-5.2-sft-harmony",
+	"kimi-k2.6-vl":             "kimi-k2.6-vl",
+
+	// 必须大写 / 混合大小写的模型
+	"glm-5.2":              "GLM-5.2",
+	"snap-chat":            "GLM-5.2",
+	"glm-5.1":              "GLM-5.1",
+	"glm-4.7":              "GLM-4.7",
+	"qwen3-vl-235b":        "Qwen3-VL-235B",
+	"qwen3.5-397b-a17b-vl": "Qwen3.5-397B-A17B-VL",
+	"qwen3.6-27b-vl":       "Qwen3.6-27B-VL",
+}
+
+var (
+	workingMu     sync.RWMutex
+	workingModels = map[string]string{} // lower(id) -> working exact case
+)
+
+// RecordWorkingModel 记录运行时验证可用的大小写映射。
+func RecordWorkingModel(requested, working string) {
+	if working == "" {
+		return
+	}
+	keyReq := strings.ToLower(strings.TrimSpace(requested))
+	keyWork := strings.ToLower(strings.TrimSpace(working))
+	workingMu.Lock()
+	workingModels[keyReq] = working
+	workingModels[keyWork] = working
+	workingMu.Unlock()
+}
+
 // CanonicalModel 把用户友好模型 ID 映射为上游 InferHub 注册的模型 ID。
 //
-// 上游按注册名精确匹配（区分大小写），而客户端习惯写小写。动态发现的模型
-// （见 models.go 的 known 索引）优先做大小写不敏感归一；旧版小写别名走下面的
-// 静态映射兜底；都不认识就原样透传。
+// 上游按注册名精确匹配（区分大小写），而客户端习惯写小写。
+// 映射优先级：
+//  1. 实测确认表 verifiedModels（防 builtin 大写展示名污染）
+//  2. 运行时已成功调用记录 workingModels
+//  3. 动态发现的已知模型 catalog.known
+//  4. 原样透传
 func CanonicalModel(id string) string {
-	if exact, ok := lookupKnownModel(id); ok {
+	raw := strings.TrimSpace(id)
+	if raw == "" {
+		return ""
+	}
+	key := strings.ToLower(raw)
+
+	// 1. 实测验证表优先
+	if exact, ok := verifiedModels[key]; ok {
 		return exact
 	}
-	switch id {
-	case "snap-chat", "glm-5.2":
-		return "GLM-5.2"
-	case "glm-5.1":
-		return "GLM-5.1"
-	case "glm-4.7":
-		return "GLM-4.7"
-	case "qwen3-vl-235b":
-		return "Qwen3-VL-235B"
-	case "qwen3.5-397b-a17b-vl":
-		return "Qwen3.5-397B-A17B-VL"
-	case "qwen3.6-27b-vl":
-		return "Qwen3.6-27B-VL"
-	default:
-		return id
+
+	// 2. 运行时已验证大小写
+	workingMu.RLock()
+	working, ok := workingModels[key]
+	workingMu.RUnlock()
+	if ok {
+		return working
 	}
+
+	// 3. 动态发现索引
+	if exact, ok := lookupKnownModel(raw); ok {
+		return exact
+	}
+
+	return raw
+}
+
+// AlternativeCases 返回用于 002002009 快速回退的大小写备选列表（按优先级去重，不含自身）。
+func AlternativeCases(model string) []string {
+	raw := strings.TrimSpace(model)
+	if raw == "" {
+		return nil
+	}
+	key := strings.ToLower(raw)
+	candidates := make([]string, 0, 4)
+
+	add := func(c string) {
+		c = strings.TrimSpace(c)
+		if c == "" || c == raw {
+			return
+		}
+		for _, exist := range candidates {
+			if exist == c {
+				return
+			}
+		}
+		candidates = append(candidates, c)
+	}
+
+	// 1. 验证表中的官方大小写
+	if v, ok := verifiedModels[key]; ok {
+		add(v)
+	}
+	// 2. 全小写
+	add(strings.ToLower(raw))
+	// 3. 动态发现的已知大小写
+	if exact, ok := lookupKnownModel(raw); ok {
+		add(exact)
+	}
+	// 4. 全大写
+	add(strings.ToUpper(raw))
+
+	return candidates
+}
+
+// IsModelNotRegisteredError 检查是否为上游 002002009 模型未注册（大小写可能不匹配）。
+func IsModelNotRegisteredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "002002009") || strings.Contains(low, "not registered")
 }
 
 // ChatHeadersV2 组装 /api/v2/chat/completions 请求头。
