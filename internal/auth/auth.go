@@ -4,6 +4,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,16 +200,27 @@ func (a *Auth) ExpiresAt() time.Time {
 }
 
 // Remaining 返回剩余有效期。
+//
+// 过期时间缺失或无法解析时返回 0（未知），不再返回 24 小时：那会让面板把
+// 「不知道何时过期」显示成「还剩一天」，并把刷新/保活判断建立在假数据上。
 func (a *Auth) Remaining() time.Duration {
 	t := a.ExpiresAt()
 	if t.IsZero() {
-		return 24 * time.Hour
+		return 0
 	}
 	return time.Until(t)
 }
 
+// ExpirationKnown 报告过期时间是否可用（用于状态展示区分「未知」与「0s」）。
+func (a *Auth) ExpirationKnown() bool { return !a.ExpiresAt().IsZero() }
+
 // Expired 报告 token 是否已过期。
-func (a *Auth) Expired() bool { return a.Remaining() <= 0 }
+func (a *Auth) Expired() bool {
+	if !a.ExpirationKnown() {
+		return false // 未知不等于过期，交给上游 401 兜底
+	}
+	return a.Remaining() <= 0
+}
 
 // ExpiringSoon 报告 token 是否将在 within 内过期。
 func (a *Auth) ExpiringSoon(within time.Duration) bool {
@@ -224,9 +236,16 @@ func (a *Auth) Save() error {
 }
 
 // SetPath 设置文件路径（LoadDir 内部调用）。
-func (a *Auth) SetPath(p string) { a.path = p }
+func (a *Auth) SetPath(p string) {
+	a.mu.Lock()
+	a.path = p
+	a.mu.Unlock()
+}
 
 // LoadDir 加载 auths 目录下全部 codearts-*.json。
+//
+// 单个文件损坏（写入中断、手工编辑出错）只跳过并打日志：此前任一文件解析失败
+// 都会让整个服务在启动时退出，一个坏文件等于全站不可用。
 func LoadDir(dir string) ([]*Auth, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -236,6 +255,7 @@ func LoadDir(dir string) ([]*Auth, error) {
 		return nil, err
 	}
 	var out []*Auth
+	var broken []string
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), "codearts-") || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -243,17 +263,24 @@ func LoadDir(dir string) ([]*Auth, error) {
 		p := filepath.Join(dir, e.Name())
 		raw, err := os.ReadFile(p)
 		if err != nil {
-			return nil, err
+			log.Printf("auth: skip %s: %v", e.Name(), err)
+			broken = append(broken, e.Name())
+			continue
 		}
 		var a Auth
 		if err := json.Unmarshal(raw, &a); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", e.Name(), err)
+			log.Printf("auth: skip %s: %v", e.Name(), err)
+			broken = append(broken, e.Name())
+			continue
 		}
 		if a.CloudDragonTok == "" {
 			continue
 		}
-		a.path = p
+		a.SetPath(p)
 		out = append(out, &a)
+	}
+	if len(out) == 0 && len(broken) > 0 {
+		return nil, fmt.Errorf("auth: %d 个凭证文件全部加载失败（%s）", len(broken), strings.Join(broken, ", "))
 	}
 	return out, nil
 }
@@ -263,7 +290,7 @@ func SaveNew(dir string, a *Auth) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	a.path = filepath.Join(dir, a.FileName())
+	a.SetPath(filepath.Join(dir, a.FileName()))
 	return a.Save()
 }
 

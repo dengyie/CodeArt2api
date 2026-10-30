@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // ApiError 带业务 code 的上游错误。
@@ -318,15 +319,15 @@ func (c *Client) requestToken(ctx context.Context, cfg LoginConfig, form url.Val
 				return nil, &RefreshTokenExpiredError{
 					Status: resp.StatusCode,
 					Message: fmt.Sprintf("refresh_token expired or rejected: http=%d error=%s code=%s msg=%s",
-						resp.StatusCode, tokenErr.Error, tokenErr.ErrorCode, truncateStr(tokenErr.ErrorMessage, 160)),
+						resp.StatusCode, tokenErr.Error, tokenErr.ErrorCode, TruncateUTF8(tokenErr.ErrorMessage, 160)),
 				}
 			}
 		}
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: EpOAuthTokens}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: TruncateUTF8(string(raw), 300), Path: EpOAuthTokens}
 	}
 	var out TokenResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("parse token response: %w body=%s", err, truncateStr(string(raw), 200))
+		return nil, fmt.Errorf("parse token response: %w body=%s", err, TruncateUTF8(string(raw), 200))
 	}
 	if out.Credentials.SecurityToken == "" {
 		// 兼容 ticket/旧通道字段（legacy）
@@ -339,7 +340,7 @@ func (c *Client) requestToken(ctx context.Context, cfg LoginConfig, form url.Val
 			}
 			return &out, nil
 		}
-		return nil, fmt.Errorf("token response missing credentials: %s", truncateStr(string(raw), 200))
+		return nil, fmt.Errorf("token response missing credentials: %s", TruncateUTF8(string(raw), 200))
 	}
 	return &out, nil
 }
@@ -576,7 +577,7 @@ func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID st
 	if resp.StatusCode >= 400 {
 		rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(rawBody), 200), Path: EpChatV2}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: TruncateUTF8(string(rawBody), 200), Path: EpChatV2}
 	}
 	return preflightSSE(resp.Body)
 }
@@ -644,7 +645,7 @@ func embeddedSSEError(data string) *ApiError {
 		// 请求参数无效（实测：tool_choice 对象形态触发）：客户端问题，不是账号故障。
 		status = http.StatusBadRequest
 	}
-	return &ApiError{Code: status, Status: status, Message: truncateStr(combined, 300), Path: EpChatV2}
+	return &ApiError{Code: status, Status: status, Message: TruncateUTF8(combined, 300), Path: EpChatV2}
 }
 
 // ---------------------------------------------------------------------------
@@ -677,11 +678,11 @@ func (c *Client) doJSON(ctx context.Context, method, baseURL, path string, heade
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode >= 400 {
-		return &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: path}
+		return &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: TruncateUTF8(string(raw), 300), Path: path}
 	}
 	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {
-			return fmt.Errorf("parse %s: %w body=%s", path, err, truncateStr(string(raw), 200))
+			return fmt.Errorf("parse %s: %w body=%s", path, err, TruncateUTF8(string(raw), 200))
 		}
 	}
 	return nil
@@ -713,12 +714,20 @@ func Log(format string, args ...any) {
 	log.Printf("upstream: "+format, args...)
 }
 
-func truncateStr(s string, n int) string {
+// TruncateUTF8 按字节上限截断，但不把多字节字符切成两半。
+// 上游错误消息多为中文，直接 s[:n] 会产出非法 UTF-8（日志与 JSON 里都是乱码）。
+func TruncateUTF8(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
+	if n <= 0 {
+		return ""
 	}
-	return s
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // CallerIdentity 用 STS 凭证查账号身份：GET {sts}/v5/caller-identity。
@@ -783,7 +792,7 @@ func signedGet(urlStr string, cred SignCredential, agentType string) ([]byte, er
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: urlStr}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: TruncateUTF8(string(raw), 300), Path: urlStr}
 	}
 	return raw, nil
 }
@@ -813,7 +822,7 @@ func (c *Client) getSigned(ctx context.Context, urlStr string, cred SignCredenti
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: req.URL.Path}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: TruncateUTF8(string(raw), 300), Path: req.URL.Path}
 	}
 	return raw, nil
 }

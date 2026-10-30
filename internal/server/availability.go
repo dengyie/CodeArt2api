@@ -62,7 +62,14 @@ type availEntry struct {
 }
 
 // probesStop 在服务退出时关闭，让带 sleep 的探测循环尽快结束。
-var probesStop = make(chan struct{})
+// 关闭用 sync.Once 保护：重复启动探测器（或测试里多次构造 Handler）时
+// 直接 close 已关闭的 channel 会 panic。
+var (
+	probesStop     = make(chan struct{})
+	probesStopOnce sync.Once
+)
+
+func stopProbes() { probesStopOnce.Do(func() { close(probesStop) }) }
 
 var availability = struct {
 	sync.Mutex
@@ -246,6 +253,8 @@ func (h *Handler) StartAvailabilityProber(ctx context.Context) { h.startAvailabi
 // 只在有账号且拿到目录后才干活，避免空转打上游。
 func (h *Handler) startAvailabilityProber(ctx context.Context) {
 	go func() {
+		// 服务退出时唤醒 runProbes 里的 probeGap 等待，别让停机卡在 sleep 上。
+		defer stopProbes()
 		// 启动后先等服务预热：立刻探测会和刚接入的客户端抢账号槽位。
 		select {
 		case <-ctx.Done():
@@ -267,18 +276,26 @@ func (h *Handler) startAvailabilityProber(ctx context.Context) {
 }
 
 // sweepAvailability 对所有健康账号的已发现模型做一轮探测（跳过已有结论的）。
+//
+// 必须走 runProbes：它既保证两次探测之间留出 probeGap（上游会话槽位释放慢，
+// 背靠背探测会占满单账号 3 个会话，紧随其后的用户请求被判 TM.00001041），
+// 也保证同一时刻只有一轮探测在跑（sweeping）。此前这里是直接 for 循环调用
+// probeModel，绕过了这两条约束 —— 约束只存在于 runProbes，而周期任务没走它。
 func (h *Handler) sweepAvailability() {
 	availability.Lock()
-	if time.Since(availability.lastSweep) < probeInterval/2 {
+	if availability.sweeping || time.Since(availability.lastSweep) < probeInterval/2 {
 		availability.Unlock()
 		return
 	}
+	availability.sweeping = true
 	availability.lastSweep = time.Now()
 	availability.Unlock()
-
-	for _, acct := range h.pendingProbes() {
-		h.probeModel(acct.acct, acct.model)
-	}
+	defer func() {
+		availability.Lock()
+		availability.sweeping = false
+		availability.Unlock()
+	}()
+	h.runProbes(h.pendingProbes())
 }
 
 // pendingProbe 一个待探测的「账号 + 模型」。

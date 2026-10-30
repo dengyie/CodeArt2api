@@ -34,7 +34,7 @@ func toolChoiceTestHandler(t *testing.T, endpoint string) (*Handler, *pool.Pool)
 
 func assertToolChoicePoolHealthy(t *testing.T, p *pool.Pool) {
 	t.Helper()
-	total, healthy, disabled, cooling, _ := p.Stats()
+	total, healthy, disabled, cooling := p.Stats()
 	if total != 2 || healthy != 2 || disabled != 0 || cooling != 0 {
 		t.Fatalf("parameter error changed pool state: total=%d healthy=%d disabled=%d cooling=%d", total, healthy, disabled, cooling)
 	}
@@ -186,7 +186,7 @@ func TestChatCompletionsServerErrorsStillCoolAccounts(t *testing.T) {
 	h, p := toolChoiceTestHandler(t, backend.URL)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]} `)))
-	_, healthy, disabled, cooling, _ := p.Stats()
+	_, healthy, disabled, cooling := p.Stats()
 	if rec.Code < 500 || attempts.Load() != 2 || healthy != 0 || disabled != 0 || cooling != 2 {
 		t.Fatalf("server errors lost failover/cooldown behavior: status=%d attempts=%d healthy=%d disabled=%d cooling=%d", rec.Code, attempts.Load(), healthy, disabled, cooling)
 	}

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type terminalErrorReader struct{ err error }
@@ -25,7 +26,7 @@ func TestStreamStopsReadingAfterDone(t *testing.T) {
 		terminalErrorReader{err: context.Canceled},
 	)
 	rec := httptest.NewRecorder()
-	if err := Stream(rec, stream, "glm-5.2"); err != nil {
+	if err := StreamCapture(rec, stream, "glm-5.2", false, nil); err != nil {
 		t.Fatalf("stream read past [DONE]: %v", err)
 	}
 	if !strings.Contains(rec.Body.String(), `"content":"ok"`) || !strings.Contains(rec.Body.String(), "data: [DONE]") {
@@ -33,10 +34,29 @@ func TestStreamStopsReadingAfterDone(t *testing.T) {
 	}
 }
 
+// 上游没发终态事件就断流：必须报截断，且不能补 [DONE]（否则客户端
+// 会把半截正文当成完整回答）。
+func TestStreamWithoutTerminalEventReportsTruncated(t *testing.T) {
+	stream := strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n")
+	rec := httptest.NewRecorder()
+	called := false
+	err := StreamCapture(rec, stream, "glm-5.2", false, func(*RawCompletion) { called = true })
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || ue.Code != ErrCodeStreamTruncated {
+		t.Fatalf("expected truncation error, got %v", err)
+	}
+	if called {
+		t.Fatal("onDone must not fire for a truncated stream")
+	}
+	if strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Fatalf("truncated stream must not be closed with [DONE]: %s", rec.Body.String())
+	}
+}
+
 func TestStreamReturnsEmbeddedErrorAfterWritingTerminalEvent(t *testing.T) {
 	stream := strings.NewReader("event: done\ndata: {\"error_code\":\"quota.429\",\"error_msg\":\"quota exceeded\"}\n\n")
 	rec := httptest.NewRecorder()
-	err := Stream(rec, stream, "glm-5.2")
+	err := StreamCapture(rec, stream, "glm-5.2", false, nil)
 	if err == nil || !strings.Contains(err.Error(), "quota exceeded") {
 		t.Fatalf("embedded upstream error was reported as success: %v", err)
 	}
@@ -102,7 +122,7 @@ func TestStreamCodeArts(t *testing.T) {
 		"event: done\ndata: {\"error_code\":\"0\"}\n\n"
 	rec := httptest.NewRecorder()
 	var captured *RawCompletion
-	err := StreamCapture(rec, bytes.NewBufferString(stream), "m", func(rc *RawCompletion) {
+	err := StreamCapture(rec, bytes.NewBufferString(stream), "m", false, func(rc *RawCompletion) {
 		captured = rc
 	})
 	if err != nil {
@@ -362,5 +382,32 @@ func TestSigner(t *testing.T) {
 	}
 	if req.Header.Get("X-Sdk-Date") == "" || req.Header.Get("X-Security-Token") != "ST" {
 		t.Fatalf("headers=%v", req.Header)
+	}
+}
+
+func TestTruncateUTF8KeepsRunesIntact(t *testing.T) {
+	s := "上游错误：模型未注册"
+	for n := 1; n < len(s); n++ {
+		got := TruncateUTF8(s, n)
+		if !utf8.ValidString(got) {
+			t.Fatalf("n=%d produced invalid UTF-8: %q", n, got)
+		}
+		if len(got) > n {
+			t.Fatalf("n=%d produced longer output: %q", n, got)
+		}
+	}
+	if got := TruncateUTF8(s, 0); got != "" {
+		t.Fatalf("n=0 => %q", got)
+	}
+	if got := TruncateUTF8("  abc  ", 10); got != "abc" {
+		t.Fatalf("trim => %q", got)
+	}
+}
+
+func TestAggregateTruncatedStreamReturnsError(t *testing.T) {
+	rc, err := AggregateRaw(bytes.NewBufferString("data: {\"text\":\"半截\"}\n"))
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || ue.Code != ErrCodeStreamTruncated {
+		t.Fatalf("expected truncation error, rc=%+v err=%v", rc, err)
 	}
 }

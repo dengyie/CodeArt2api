@@ -77,7 +77,7 @@ func (c *Client) creditRequest(ctx context.Context, method, path string, body an
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Path: req.URL.Path, Message: truncateStr(string(response), 300)}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Path: req.URL.Path, Message: TruncateUTF8(string(response), 300)}
 	}
 	var envelope struct {
 		Code    *int            `json:"code"`

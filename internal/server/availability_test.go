@@ -154,8 +154,8 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
 		Message: "InferHub.002002009.404 The model is not registered, please request other model",
 	}
-	if !h.handleUpstreamError(p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404) {
-		t.Error("模型级错误应返回 true，让调用方立即结束轮转")
+	if got := h.handleUpstreamError(p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404); got != errModelUnavailable {
+		t.Errorf("模型级错误应分类为 errModelUnavailable（换号继续，全部失败才 404），got=%v", got)
 	}
 
 	if !p.Healthy("u-cool") {
@@ -164,5 +164,51 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 	st, reason := modelAvailability("u-cool", "GLM-5.2-ArkTS-SPARK")
 	if st != availUnusable || reason == "" {
 		t.Errorf("应记为模型不可用，got state=%v reason=%q", st, reason)
+	}
+}
+
+// 周期探测必须受 lastSweep 节流：否则每次 ticker 都重跑一轮，
+// 探针会长期占用上游会话槽位，把真实请求挤进 TM.00001041。
+func TestSweepAvailabilityHonorsInterval(t *testing.T) {
+	p, err := pool.New(nil, pool.Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p})
+
+	// 刚扫过：本轮必须直接返回，不推进时间戳。
+	recent := time.Now()
+	availability.Lock()
+	availability.lastSweep = recent
+	availability.sweeping = false
+	availability.Unlock()
+
+	h.sweepAvailability()
+
+	availability.Lock()
+	gotLast, gotSweeping := availability.lastSweep, availability.sweeping
+	availability.Unlock()
+	if !gotLast.Equal(recent) {
+		t.Errorf("间隔不足时不得刷新 lastSweep，got=%s", gotLast)
+	}
+	if gotSweeping {
+		t.Error("sweeping 标志必须在返回前复位")
+	}
+
+	// 超过间隔：真正跑一轮，并刷新时间戳。
+	availability.Lock()
+	availability.lastSweep = time.Now().Add(-probeInterval)
+	availability.Unlock()
+
+	h.sweepAvailability()
+
+	availability.Lock()
+	gotLast, gotSweeping = availability.lastSweep, availability.sweeping
+	availability.Unlock()
+	if !gotLast.After(recent) {
+		t.Errorf("超过间隔应刷新 lastSweep，got=%s", gotLast)
+	}
+	if gotSweeping {
+		t.Error("sweeping 标志必须在返回前复位")
 	}
 }

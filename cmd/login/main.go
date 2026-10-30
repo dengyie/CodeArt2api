@@ -31,6 +31,7 @@ func main() {
 	authDir := flag.String("auth-dir", "./auths", "auth output dir")
 	printOnly := flag.Bool("print-only", false, "server mode: print login link and poll (no local browser)")
 	clientID := flag.String("client-id", upstream.CLIENT_ID, "OAuth client id (uri scheme)")
+	timeout := flag.Duration("timeout", 5*time.Minute, "how long to wait for the login to finish")
 	flag.Parse()
 
 	cfg := upstream.DefaultLoginConfig()
@@ -96,14 +97,14 @@ func main() {
 	// 3. 双通道：回调 code vs ticket 轮询
 	var tok *upstream.TokenResponse
 	ticker := time.NewTicker(2 * time.Second)
-	timer := time.NewTimer(5 * time.Minute)
+	timer := time.NewTimer(*timeout)
 	defer ticker.Stop()
 	defer timer.Stop()
 loginLoop:
 	for {
 		select {
 		case <-timer.C:
-			log.Fatalf("登录超时（5 分钟）")
+			log.Fatalf("登录超时（%s）", timeout.String())
 		case code := <-codeCh:
 			tok, err = client.ExchangeCode(ctx, cfg, code, verifier, callbackPort, dpopPrivateJWK)
 			if err != nil {

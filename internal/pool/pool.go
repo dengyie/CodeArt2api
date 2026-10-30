@@ -25,6 +25,9 @@ const (
 	CoolPlan
 )
 
+// refreshTimeout 单次 token 刷新（STS + 落盘）的上限。
+const refreshTimeout = 30 * time.Second
+
 // Account 一个上游账号。
 type Account struct {
 	Name         string `json:"name"`
@@ -57,7 +60,7 @@ type Config struct {
 	ErrCooldown     time.Duration
 	SoftCooldown    time.Duration
 	RefreshSkew     time.Duration        // token 到期前多久自动刷新
-	MaxConcurrent   int                  // 单账号最大并发数（默认 5）
+	MaxConcurrent   int                  // 单账号最大并发数（默认 1：上游会话释放慢，串行最稳）
 	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
 	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
 	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
@@ -69,6 +72,19 @@ type Pool struct {
 	state    string
 	mu       sync.Mutex
 	accounts []*Account
+	// stateCh 状态落盘通道（容量 1，最新状态覆盖旧的）。状态写盘不占用 p.mu，
+	// 也不阻塞调用方：冷却/计错发生在请求路径上，不该等磁盘。
+	stateCh chan []stateEntry
+}
+
+// stateEntry 状态文件的单账号记录（持久化冷却/禁用，重启后延续）。
+type stateEntry struct {
+	Name      string    `json:"name"`
+	ErrCount  int       `json:"err_count"`
+	CoolUntil time.Time `json:"cool_until"`
+	Disabled  bool      `json:"disabled"`
+	Reason    string    `json:"reason"`
+	LastErr   string    `json:"last_error"`
 }
 
 // New 构建池。
@@ -97,6 +113,10 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 		cfg.LoginConfig = upstream.DefaultLoginConfig()
 	}
 	p := &Pool{cfg: cfg, state: stateFile}
+	if stateFile != "" {
+		p.stateCh = make(chan []stateEntry, 1)
+		go p.stateWriter()
+	}
 	for _, a := range auths {
 		acct := &Account{
 			Name:              a.UserID,
@@ -144,7 +164,7 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 		keepaliveLastPing: time.Now(),
 	}
 	p.mu.Lock()
-	for i, existing := range p.accounts {
+	for _, existing := range p.accounts {
 		if existing.Name == acct.Name {
 			existing.mu.Lock()
 			existing.Auth = a
@@ -159,7 +179,6 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 			p.saveState()
 			return existing
 		}
-		p.accounts[i] = existing
 	}
 	p.accounts = append(p.accounts, acct)
 	p.mu.Unlock()
@@ -185,13 +204,16 @@ func (p *Pool) List() []map[string]any {
 		if reason == "" {
 			reason = a.lastErr
 		}
+		remaining := "unknown"
+		if a.Auth.ExpirationKnown() {
+			remaining = a.Auth.Remaining().Round(time.Minute).String()
+		}
 		out = append(out, map[string]any{
 			"name":              a.Name,
 			"uid":               a.UID,
 			"nickname":          a.UserName,
 			"user_name":         a.UserName,
 			"default_model":     a.DefaultModel,
-			"credits":           int64(0), // 保留旧字段；未查询真实余额
 			"checkin":           a.checkin,
 			"disabled":          a.disabled,
 			"cooling":           cooling,
@@ -201,7 +223,7 @@ func (p *Pool) List() []map[string]any {
 			"last_error":        a.lastErr,
 			"active_concurrent": a.activeConcurrent,
 			"max_concurrent":    a.maxConcurrent,
-			"token_remaining":   a.Auth.Remaining().Round(time.Minute).String(),
+			"token_remaining":   remaining,
 			"expires_at":        a.Auth.ExpiresAt().Format(time.RFC3339),
 		})
 		a.mu.Unlock()
@@ -210,8 +232,8 @@ func (p *Pool) List() []map[string]any {
 	return out
 }
 
-// Stats 汇总。
-func (p *Pool) Stats() (total, healthy, disabled, cooling int, credits int64) {
+// Stats 汇总（total/healthy/disabled/cooling）。
+func (p *Pool) Stats() (total, healthy, disabled, cooling int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -227,7 +249,6 @@ func (p *Pool) Stats() (total, healthy, disabled, cooling int, credits int64) {
 		}
 		a.mu.Unlock()
 	}
-	credits = int64(healthy) // 面板「积分合计」位复用为健康数
 	return
 }
 
@@ -508,12 +529,12 @@ func (p *Pool) ReleaseLock(name string) {
 			break
 		}
 	}
-	// 唤醒等待槽位的 AcquireLockWait（轮询方式无需 broadcast，此处保留语义占位）。
 }
 
 // AcquireLockWait 阻塞等待账号并发槽位，超时返回 false。
 //
-// 上游单账号并发会话上限 3，本池 maxConcurrent 默认 2 留余量。
+// 上游单账号并发会话上限 3；本池 maxConcurrent 默认 1（会话释放实测 >15s，
+// 串行最稳），需要时按账号调高，但不要超过 3。
 // 高并发请求在此排队等待槽位释放，而非立即失败跳号。
 // timeout=0 时等价于非阻塞 AcquireLock。
 func (p *Pool) AcquireLockWait(name string, timeout time.Duration) bool {
@@ -599,9 +620,15 @@ func (p *Pool) CheckAndRefreshTokenWithin(name string, skew time.Duration) error
 
 	acct.mu.Lock()
 	remaining := acct.Auth.Remaining()
+	known := acct.Auth.ExpirationKnown()
 	hasRefresh := acct.Auth.Refresh() != ""
 	acct.mu.Unlock()
 
+	if !known {
+		// 没有可解析的过期时间：无从判断「临近到期」，不做主动刷新
+		// （否则每个 tick 都会刷新一次），交给 401 兜底。
+		return nil
+	}
 	if remaining > skew {
 		return nil
 	}
@@ -612,11 +639,6 @@ func (p *Pool) CheckAndRefreshTokenWithin(name string, skew time.Duration) error
 	log.Printf("pool proactive refresh account=%s remaining=%s skew=%s",
 		name, remaining.Round(time.Minute), skew)
 	return p.RefreshToken(name)
-}
-
-// CheckAndRefreshToken 检查 token 是否快过期并主动刷新（比 scheduler 更积极）。
-func (p *Pool) CheckAndRefreshToken(name string) error {
-	return p.CheckAndRefreshTokenWithin(name, time.Hour)
 }
 
 // RefreshToken 手动刷新指定账号的 token。
@@ -646,7 +668,11 @@ func (p *Pool) RefreshToken(name string) error {
 		return fmt.Errorf("no DPoP private key available; re-login required")
 	}
 
-	resp, err := acct.Client.RefreshToken(context.Background(), p.cfg.LoginConfig, refreshToken, authz.Verifier(), upstream.DPoPPrivateJWK(dpopPrivateJWK))
+	// 有界超时：刷新在请求路径上被调用（上游 401 后重试），一次卡死的刷新
+	// 会阻塞整个 handler 直到客户端超时，因此必须自带 deadline。
+	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+	defer cancel()
+	resp, err := acct.Client.RefreshToken(ctx, p.cfg.LoginConfig, refreshToken, authz.Verifier(), upstream.DPoPPrivateJWK(dpopPrivateJWK))
 	if err != nil {
 		return fmt.Errorf("refresh failed: %w", err)
 	}
@@ -668,238 +694,6 @@ func (p *Pool) RefreshToken(name string) error {
 	acct.mu.Unlock()
 	log.Printf("pool token refreshed manually account=%s", name)
 	return nil
-}
-
-// RefreshAllTokens 批量刷新所有临期 token（用于 cron 或脚本）。
-func (p *Pool) RefreshAllTokens() int {
-	count := 0
-	for _, acct := range p.Accounts() {
-		if err := p.CheckAndRefreshToken(acct.Name); err == nil {
-			count++
-		}
-	}
-	return count
-}
-
-// Acquire 尝试获取账号并发 slot（返回 true 表示成功，调用方需随后 Release）。
-func (p *Pool) Acquire(name string) bool {
-	p.mu.Lock()
-	var target *Account
-	for _, a := range p.accounts {
-		if a.Name == name {
-			target = a
-			break
-		}
-	}
-	p.mu.Unlock()
-	if target == nil {
-		return false
-	}
-	target.mu.Lock()
-	defer target.mu.Unlock()
-
-	// 检查是否超过最大并发限制
-	if target.activeConcurrent >= target.maxConcurrent {
-		return false
-	}
-	// 检查是否正在冷却
-	if !time.Now().After(target.coolUntil) {
-		return false
-	}
-	// 增加活跃计数
-	target.activeConcurrent++
-	target.keepaliveLastPing = time.Now()
-	return true
-}
-
-// Release 释放账号并发 slot。
-func (p *Pool) Release(name string) {
-	p.mu.Lock()
-	var target *Account
-	for _, a := range p.accounts {
-		if a.Name == name {
-			target = a
-			break
-		}
-	}
-	p.mu.Unlock()
-	if target == nil {
-		return
-	}
-	target.mu.Lock()
-	defer target.mu.Unlock()
-	if target.activeConcurrent > 0 {
-		target.activeConcurrent--
-	}
-}
-
-// CheckKeepalive 检查是否需要保活心跳。
-func (p *Pool) CheckKeepalive(name string) bool {
-	p.mu.Lock()
-	var target *Account
-	for _, a := range p.accounts {
-		if a.Name == name {
-			target = a
-			break
-		}
-	}
-	p.mu.Unlock()
-	if target == nil {
-		return false
-	}
-	target.mu.Lock()
-	defer target.mu.Unlock()
-
-	// 如果超过保活窗口无活动，需要保活
-	needsKeepalive := time.Since(target.keepaliveLastPing) > p.cfg.KeepaliveWindow
-	if needsKeepalive {
-		target.keepaliveLastPing = time.Now()
-	}
-	return needsKeepalive
-}
-
-// SetKeepalive 手动更新保活时间。
-func (p *Pool) SetKeepalive(name string) {
-	p.mu.Lock()
-	var target *Account
-	for _, a := range p.accounts {
-		if a.Name == name {
-			target = a
-			break
-		}
-	}
-	p.mu.Unlock()
-	if target == nil {
-		return
-	}
-	target.mu.Lock()
-	defer target.mu.Unlock()
-	target.keepaliveLastPing = time.Now()
-}
-
-// GetConcurrentStats 获取账号并发统计信息。
-func (p *Pool) GetConcurrentStats() []map[string]any {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	out := make([]map[string]any, 0, len(p.accounts))
-	now := time.Now()
-	for _, a := range p.accounts {
-		a.mu.Lock()
-		cooling := !a.disabled && now.Before(a.coolUntil)
-		concurrent := a.activeConcurrent
-		maxConc := a.maxConcurrent
-		lastPing := a.keepaliveLastPing
-		a.mu.Unlock()
-
-		out = append(out, map[string]any{
-			"name":              a.Name,
-			"uid":               a.UID,
-			"user_name":         a.UserName,
-			"active_concurrent": concurrent,
-			"max_concurrent":    maxConc,
-			"utilization":       float64(concurrent) / float64(maxConc),
-			"last_keepalive":    lastPing.Format(time.RFC3339),
-			"cooling":           cooling,
-			"disabled":          a.disabled,
-		})
-	}
-	return out
-}
-
-// TryAcquire 尝试获取账号的并发槽位，成功返回 true 并增加计数。
-func (p *Pool) TryAcquire(name string) bool {
-	p.mu.Lock()
-	var target *Account
-	for _, a := range p.accounts {
-		if a.Name == name {
-			target = a
-			break
-		}
-	}
-	p.mu.Unlock()
-
-	if target == nil {
-		return false
-	}
-
-	target.mu.Lock()
-	defer target.mu.Unlock()
-
-	if target.disabled || time.Now().Before(target.coolUntil) {
-		return false
-	}
-
-	if target.activeConcurrent >= target.maxConcurrent {
-		log.Printf("pool concurrent limit reached account=%s active=%d max=%d",
-			name, target.activeConcurrent, target.maxConcurrent)
-		return false
-	}
-
-	target.activeConcurrent++
-	target.keepaliveLastPing = time.Now()
-	return true
-}
-
-// NeedsKeepalive 检查账号是否需要保活心跳。
-func (p *Pool) NeedsKeepalive(name string) bool {
-	p.mu.Lock()
-	var target *Account
-	for _, a := range p.accounts {
-		if a.Name == name {
-			target = a
-			break
-		}
-	}
-	p.mu.Unlock()
-
-	if target == nil {
-		return false
-	}
-
-	target.mu.Lock()
-	defer target.mu.Unlock()
-
-	// 超过窗口期无活动则需保活
-	return time.Since(target.keepaliveLastPing) > p.cfg.KeepaliveWindow
-}
-
-// UpdateKeepalive 更新账号的最后保活时间。
-func (p *Pool) UpdateKeepalive(name string) {
-	p.mu.Lock()
-	var target *Account
-	for _, a := range p.accounts {
-		if a.Name == name {
-			target = a
-			break
-		}
-	}
-	p.mu.Unlock()
-
-	if target != nil {
-		target.mu.Lock()
-		target.keepaliveLastPing = time.Now()
-		target.mu.Unlock()
-	}
-}
-
-// SetMaxConcurrent 设置账号的最大并发数。
-func (p *Pool) SetMaxConcurrent(name string, max int) {
-	p.mu.Lock()
-	var target *Account
-	for _, a := range p.accounts {
-		if a.Name == name {
-			target = a
-			break
-		}
-	}
-	p.mu.Unlock()
-
-	if target != nil {
-		target.mu.Lock()
-		target.maxConcurrent = max
-		target.mu.Unlock()
-	}
 }
 
 func (p *Pool) loadState() {
@@ -936,22 +730,44 @@ func (p *Pool) loadState() {
 	}
 }
 
+// saveState 拍状态快照并交给后台 writer 落盘（调用方须持有 p.mu）。
+//
+// 只做内存拷贝，不做磁盘 I/O；写在 stateWriter 里串行完成。此前是在 p.mu 内
+// 直接 WriteFile+Rename，且错误被静默吞掉 —— 慢盘会阻塞所有取号，写失败则
+// 面板显示的状态与重启后的状态不一致且无任何线索。
 func (p *Pool) saveState() {
-	if p.state == "" {
+	if p.stateCh == nil {
 		return
 	}
-	type entry struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
+	out := p.snapshotState()
+	// 容量 1 的最新值语义：写不过来时丢掉排队中的旧快照，永远保留最新状态。
+	select {
+	case p.stateCh <- out:
+	default:
+		select {
+		case <-p.stateCh:
+		default:
+		}
+		select {
+		case p.stateCh <- out:
+		default:
+		}
 	}
-	out := make([]entry, 0, len(p.accounts))
-	for _, a := range p.accounts {
+}
+
+// snapshotState 取当前账号状态快照（不持锁调用，内部自行加锁）。
+func (p *Pool) snapshotState() []stateEntry {
+	// 先在锁内取账号切片快照：并发 AddAccount 会 append p.accounts，
+	// 直接 range 会读到正在扩容的 slice（数据竞争/丢账号）。
+	p.mu.Lock()
+	accounts := make([]*Account, len(p.accounts))
+	copy(accounts, p.accounts)
+	p.mu.Unlock()
+
+	out := make([]stateEntry, 0, len(accounts))
+	for _, a := range accounts {
 		a.mu.Lock()
-		out = append(out, entry{
+		out = append(out, stateEntry{
 			Name:      a.Name,
 			ErrCount:  a.errCount,
 			CoolUntil: a.coolUntil,
@@ -961,10 +777,38 @@ func (p *Pool) saveState() {
 		})
 		a.mu.Unlock()
 	}
-	raw, _ := json.MarshalIndent(out, "", "  ")
-	tmp := p.state + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	return out
+}
+
+func (p *Pool) stateWriter() {
+	for entries := range p.stateCh {
+		if err := p.writeState(entries); err != nil {
+			log.Printf("pool save state: %v", err)
+		}
+	}
+}
+
+// FlushState 同步落盘当前状态（进程退出前调用，避免最后一批状态丢失）。
+func (p *Pool) FlushState() {
+	if p.state == "" {
 		return
 	}
-	_ = os.Rename(tmp, p.state)
+	if err := p.writeState(p.snapshotState()); err != nil {
+		log.Printf("pool flush state: %v", err)
+	}
+}
+
+func (p *Pool) writeState(entries []stateEntry) error {
+	raw, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	tmp := p.state + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, p.state); err != nil {
+		return fmt.Errorf("rename %s: %w", p.state, err)
+	}
+	return nil
 }

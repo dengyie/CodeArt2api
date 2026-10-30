@@ -110,6 +110,8 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
+	// 状态文件由后台 goroutine 异步写，退出前同步落一次，避免丢掉最后的冷却/禁用状态。
+	p.FlushState()
 	log.Printf("bye")
 }
 

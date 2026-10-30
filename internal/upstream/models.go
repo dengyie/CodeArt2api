@@ -442,7 +442,7 @@ func (c *Client) fetchBuiltinModels(accountID string, cred SignCredential) ([]Mo
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode >= 400 {
 		c.noteSrcFail(key)
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: EpModelBuiltin}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: TruncateUTF8(string(raw), 300), Path: EpModelBuiltin}
 	}
 	var out struct {
 		BuiltinModels []struct {
@@ -494,7 +494,7 @@ func (c *Client) ClaimBenefit(cred SignCredential) error {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: EpBenefitClaim}
+		return &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: TruncateUTF8(string(raw), 300), Path: EpBenefitClaim}
 	}
 	var out struct {
 		ErrorCode string `json:"error_code"`
@@ -541,7 +541,7 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode >= 400 {
 		c.noteSrcFail(key)
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: EpBenefitConfig}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: TruncateUTF8(string(raw), 300), Path: EpBenefitConfig}
 	}
 	var out struct {
 		ErrorCode string `json:"error_code"`

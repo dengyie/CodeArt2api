@@ -4,7 +4,7 @@
 //   - onAnswer:  {"text":"增量","custom_extra_info":...}
 //   - reasoning / thinking: 思考链增量
 //   - done:      {"error_code":"0","error_msg":"","related_question_answer":[...],"response_message_id":"..."}
-//                 related_question_answer 是「相关追问」建议，不是正文，解析时忽略。
+//     related_question_answer 是「相关追问」建议，不是正文，解析时忽略。
 //   - error / heartbeat 等
 //
 // 另：部分帧可能直接给出 structured QA 对象 {question,options,answer}（无 text 字段）。
@@ -21,6 +21,9 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrCodeStreamTruncated 上游未发终态事件就断流（回答被截断）。
+const ErrCodeStreamTruncated = "STREAM_TRUNCATED"
 
 // UpstreamError 流内业务错误。
 type UpstreamError struct {
@@ -206,7 +209,9 @@ func sortedToolCalls(calls toolCallAccumulator) []ChatToolCall {
 }
 
 // applyEvent 把单事件应用到聚合状态。
-func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, event, data string) {
+// terminal 在该事件表示「本轮回答已正常结束」时置 true：只有它出现，
+// 才能把流判为完整；EOF 而不见 terminal 即视为上游截断。
+func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, terminal *bool, event, data string) {
 	event = strings.ToLower(strings.TrimSpace(event))
 	var payload map[string]any
 	if strings.TrimSpace(data) != "" {
@@ -227,6 +232,7 @@ func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, 
 			if *finish == "" {
 				*finish = "stop"
 			}
+			*terminal = true
 			return
 		}
 		// 纯 data 行（CodeArts 部分响应无 event 前缀）
@@ -253,11 +259,13 @@ func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, 
 			if *finish == "" {
 				*finish = "stop"
 			}
+			*terminal = true
 			return
 		}
 		if t := text("text", "content", "delta"); t != "" {
 			if t == "[DONE]" || t == "[DONE] " || strings.EqualFold(t, "done") {
 				*finish = "stop"
+				*terminal = true
 				return
 			}
 			// 实测：text 为全文快照（非增量）→ 替换
@@ -325,6 +333,7 @@ func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, 
 		} else {
 			*finish = "stop"
 		}
+		*terminal = true
 	}
 }
 
@@ -395,12 +404,13 @@ func firstNonEmpty(values ...string) string {
 func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
-		content strings.Builder
-		reason  strings.Builder
-		finish  = "stop"
-		upErr   error
-		calls   = make(toolCallAccumulator)
-		usage   map[string]any
+		content  strings.Builder
+		reason   strings.Builder
+		finish   = "stop"
+		upErr    error
+		terminal bool
+		calls    = make(toolCallAccumulator)
+		usage    map[string]any
 	)
 	var pendingEvent string
 	for {
@@ -417,7 +427,7 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 				delta, _ := deltaFromChunk(payload)
 				applyToolCallDeltas(delta, calls)
 			}
-			applyEvent(&content, &reason, &finish, &upErr, ev, data)
+			applyEvent(&content, &reason, &finish, &upErr, &terminal, ev, data)
 		}
 		if err == io.EOF {
 			break
@@ -425,6 +435,11 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 	}
 	if upErr != nil {
 		return nil, upErr
+	}
+	if !terminal {
+		// 上游连接在回答中途断开：此前这里返回 finish="stop" 的「成功」结果，
+		// 客户端拿到半截正文却以为回答完整。宁可报错，也不伪造完成。
+		return nil, &UpstreamError{Code: ErrCodeStreamTruncated, Msg: "upstream closed the stream before a terminal event"}
 	}
 	return &RawCompletion{
 		Content:   unwrapQAContent(content.String()),
@@ -435,44 +450,12 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 	}, nil
 }
 
-// Aggregate 非流式聚合为 OpenAI chat.completion。
-func Aggregate(r io.Reader, model string) (map[string]any, error) {
-	rc, err := AggregateRaw(r)
-	if err != nil {
-		return nil, err
-	}
-	message := map[string]any{"role": "assistant", "content": rc.Content}
-	if rc.Reasoning != "" {
-		message["reasoning_content"] = rc.Reasoning
-	}
-	if len(rc.ToolCalls) > 0 {
-		message["tool_calls"] = rc.ToolCalls
-		if rc.Content == "" {
-			message["content"] = nil
-		}
-	}
-	return map[string]any{
-		"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   model,
-		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": rc.Finish}},
-	}, nil
-}
-
-// Stream 实时转换 SSE，保证至少一个 [DONE]。
-func Stream(w http.ResponseWriter, r io.Reader, model string) error {
-	return StreamCaptureWithUsage(w, r, model, nil, nil)
-}
-
-// StreamCapture 同 Stream，正常结束时回调聚合结果。
-func StreamCapture(w http.ResponseWriter, r io.Reader, model string, onDone func(*RawCompletion)) error {
-	return StreamCaptureWithUsage(w, r, model, onDone, nil)
-}
-
-// StreamCaptureWithUsage emits a final usage chunk when usageFor is non-nil.
-// usageFor can supply an estimate when the upstream omits usage.
-func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, onDone func(*RawCompletion), usageFor func(*RawCompletion) map[string]any) error {
+// StreamCapture 实时转换 SSE 为 OpenAI chunk，正常结束时回调聚合结果。
+//
+// 只透传上游真实给出的 usage：上游没给就不写 usage 字段（不估算、不伪造）；
+// includeUsage 对应客户端的 stream_options.include_usage，未开启时不发 usage chunk
+// （OpenAI 的语义：客户端没要就别塞）。
+func StreamCapture(w http.ResponseWriter, r io.Reader, model string, includeUsage bool, onDone func(*RawCompletion)) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -482,7 +465,9 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
-	sawDone := false
+	// terminal 由 applyEvent 置位：表示上游已给出「本轮回答结束」的信号。
+	// 它与「已经给客户端写过 [DONE]」是两件事，必须分开记。
+	terminal := false
 	var (
 		content   strings.Builder
 		reason    strings.Builder
@@ -508,9 +493,6 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			"model":   model,
 			"choices": []any{choice},
 		}
-		if usageFor != nil {
-			chunk["usage"] = nil
-		}
 		raw, _ := json.Marshal(chunk)
 		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
 			return err
@@ -521,14 +503,16 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		return nil
 	}
 	writeDONE := func(success bool) error {
-		if success && usageFor != nil {
-			chunk := map[string]any{
-				"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(),
-				"model": model, "choices": []any{}, "usage": usageFor(completion()),
-			}
-			raw, _ := json.Marshal(chunk)
-			if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
-				return err
+		if success && includeUsage {
+			if u := completion().Usage; u != nil {
+				chunk := map[string]any{
+					"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(),
+					"model": model, "choices": []any{}, "usage": u,
+				}
+				raw, _ := json.Marshal(chunk)
+				if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
+					return err
+				}
 			}
 		}
 		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
@@ -559,14 +543,10 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		}
 		if ev, data, ok := scanLine(strings.TrimRight(line, "\r\n"), &pendingEvent); ok {
 			if strings.TrimSpace(data) == "[DONE]" {
-				if !sawDone {
-					if werr := writeDONE(true); werr != nil {
-						streamErr = werr
-						break
-					}
-					sawDone = true
+				if werr := writeDONE(true); werr != nil {
+					streamErr = werr
 				}
-				break
+				return streamErr
 			}
 			var payload map[string]any
 			_ = json.Unmarshal([]byte(data), &payload)
@@ -577,19 +557,15 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			applyToolCallDeltas(nativeDelta, calls)
 			var upErr error
 			beforeContent, beforeReason := content.Len(), reason.Len()
-			applyEvent(&content, &reason, &finish, &upErr, ev, data)
+			applyEvent(&content, &reason, &finish, &upErr, &terminal, ev, data)
 			if upErr != nil {
 				if werr := writeErr(upErr.Error()); werr != nil {
-					streamErr = werr
-					break
+					return werr
 				}
 				if werr := writeDONE(false); werr != nil {
-					streamErr = werr
-					break
+					return werr
 				}
-				sawDone = true
-				streamErr = upErr
-				break
+				return upErr
 			}
 			delta := map[string]any{}
 			if role, ok := nativeDelta["role"].(string); ok && role != "" {
@@ -606,36 +582,34 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			}
 			if len(delta) > 0 || nativeFinish != "" {
 				if werr := writeChunk(delta, nativeFinish); werr != nil {
-					streamErr = werr
-					break
+					return werr
 				}
 			}
-			if strings.EqualFold(ev, "done") || strings.EqualFold(ev, "end") || strings.EqualFold(ev, "finish") {
+			if terminal {
+				// 终态事件（done/end/finish、[DONE]、纯 usage 终帧、text=done）：
+				// 补一个带 finish_reason 的空 chunk（客户端据此收尾），再写 [DONE]。
 				if nativeFinish == "" {
 					if werr := writeChunk(map[string]any{}, finish); werr != nil {
-						streamErr = werr
-						break
+						return werr
 					}
 				}
 				if werr := writeDONE(true); werr != nil {
-					streamErr = werr
-					break
+					return werr
 				}
-				sawDone = true
+				if onDone != nil {
+					onDone(completion())
+				}
+				return nil
 			}
-		}
-		if sawDone {
-			break
 		}
 		if err == io.EOF {
 			break
 		}
 	}
-	if streamErr == nil && !sawDone {
-		streamErr = writeDONE(true)
-	}
-	if streamErr == nil && onDone != nil {
-		onDone(completion())
+	if streamErr == nil {
+		// 上游在回答中途断开：不补 [DONE]。客户端据此能判定「流被截断」，
+		// 而不是把半截正文当作完整回答。
+		streamErr = &UpstreamError{Code: ErrCodeStreamTruncated, Msg: "upstream closed the stream before a terminal event"}
 	}
 	return streamErr
 }

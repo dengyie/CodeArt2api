@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	crand "crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -88,16 +89,22 @@ const (
 
 const maxBodyBytes = 8 << 20
 
+// maxConvAcct 黏性路由缓存的会话数上限。每个新会话都会写一条，不设上限就是
+// 一个只增不减的 map（长跑必涨）。超出后按插入顺序淘汰最旧的条目。
+const maxConvAcct = 4096
+
 // Handler 主路由。
 type Handler struct {
 	cfg   Config
 	mux   *http.ServeMux
 	oauth *oauthStore
 
-	convMu sync.Mutex
-	chats  map[string]string // account → 最近 chat_id
+	convMu     sync.Mutex
+	convFileMu sync.Mutex        // 串行化状态文件写盘（并发请求会同时调 saveChats）
+	chats      map[string]string // account → 最近 chat_id
 	// 黏性路由：conversation_id → account_name（多轮续接锁定同一账号，减少上游并发会话占用）。
-	convAcct map[string]string
+	convAcct  map[string]string
+	convOrder []string // convAcct 的插入顺序，用于在超限时淘汰最旧的键
 
 	loginMu sync.Mutex
 	logins  map[string]*pendingLogin
@@ -282,35 +289,24 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("<h3>登录成功，可关闭此页面并回到 WebUI。</h3>"))
 }
 
-func tokName(t *upstream.TokenResponse) string {
-	if t == nil {
-		return ""
-	}
-	return t.UserName
-}
-
-func tokToken(t *upstream.TokenResponse) string {
-	if t == nil {
-		return ""
-	}
-	return t.Credentials.SecurityToken
-}
-
 // saveLoginResult 落盘 auth 并加入账号池。
-func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier string, dpopPrivateJWK ...upstream.DPoPPrivateJWK) error {
+//
+// dpopPrivateJWK 必须是独立参数而不是可变参数：refresh_token 与签发时的 DPoP
+// 公钥绑定，缺私钥的凭据在 2 小时 STS 到期后永远刷不动。此前用变参表达「可选」，
+// ticket 轮询路径漏传后静默写出不可续期的账号，直到到期才暴露。
+func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier string, dpopPrivateJWK upstream.DPoPPrivateJWK) error {
 	if h.cfg.AuthDir == "" {
 		return errors.New("auth_dir not configured")
 	}
-	cred := tok.Credentials
-	var privateJWK map[string]string
-	if len(dpopPrivateJWK) > 0 {
-		privateJWK = map[string]string(dpopPrivateJWK[0])
+	if tok.RefreshToken != "" && dpopPrivateJWK["d"] == "" {
+		return errors.New("登录结果含 refresh_token 但缺少 DPoP 私钥：落盘后将无法续期，拒绝保存")
 	}
+	cred := tok.Credentials
 	a := auth.New(tok.UserID, tok.UserName, tok.DomainID,
 		cred.SecurityToken, cred.AccessKeyID, cred.SecretAccessKey,
 		cred.Expiration, tok.RefreshToken, codeVerifier)
 	a.SetClientID(h.cfg.LoginConfig.ClientID)
-	a.SetDPoPPrivateKey(privateJWK)
+	a.SetDPoPPrivateKey(map[string]string(dpopPrivateJWK))
 
 	// portal 回调只回传 code，不带身份；user_id 为空会让 auth.FileName() 退化成
 	// codearts-unknown.json，账号池按 UserID 建索引就会加载不到（或与既有账号重复）。
@@ -418,9 +414,9 @@ func (h *Handler) modelList() []map[string]any {
 				kept = append(kept, e)
 			}
 		}
-		if len(kept) > 0 {
-			entries = kept
-		}
+		// 全部已知不可用时返回空列表，而不是把 404 模型再端出去：
+		// 客户端看到空列表会去查明原因，看到必然失败的模型只会反复重试。
+		entries = kept
 	}
 	// 刚发现到的模型还没有可用性结论：后台补一轮探测，供后续请求过滤。
 	// （首次请求返回的是「发现结果」，之后才收敛到「真实可用」。）
@@ -571,86 +567,6 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	return infos
 }
 
-// pickAccount 挑一个「目录里登记了这个模型」的健康账号，没有则退回普通轮转。
-//
-// 混合账号池里各账号的套餐不同：/v1/models 展示的是并集，若把请求先发给目录里
-// 没有该模型的账号，上游会按「未注册模型」报 400，既浪费一次轮转（MaxRotate 只有
-// 3 次，池子超过 3 个账号时可能永远轮不到有能力的那台），又会给健康账号记错误、
-// 累计到阈值就冷却 10 分钟。所以按能力优先挑号。
-func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account {
-	want := strings.ToLower(upstream.CanonicalModel(model))
-	if acct := h.pickByCatalog(tried, want); acct != nil {
-		return acct
-	}
-	// 目录里没人登记这个模型。两种可能：① 谁都没有；② 目录还没发现
-	// （客户端只调 /v1/chat/completions、从没调过 /v1/models 就属于这种）。
-	// 直接退回轮转的话，混合池里没有该模型的账号会先吃一次 400，白耗 MaxRotate
-	// （默认 3 次，账号多于 3 个时可能永远轮不到有能力的那台），还会给健康账号
-	// 记错误、到阈值冷却 10 分钟。所以先补齐缺失的目录再挑一次。
-	h.discoverMissingCatalogs(tried)
-	if acct := h.pickByCatalog(tried, want); acct != nil {
-		return acct
-	}
-	return h.cfg.Pool.PickExcluding(tried)
-}
-
-// pickByCatalog 在已发现目录的健康账号里挑第一个能服务该模型的。
-func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.Account {
-	for _, acct := range h.cfg.Pool.Accounts() {
-		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
-			continue
-		}
-		if models, known := upstream.AccountModels(acct.UID); known && catalogHas(models, wantLower) {
-			if st, _ := modelAvailability(acct.UID, wantLower); st == availUnusable {
-				continue // 该账号实测调不通这个模型，别选它
-			}
-			return acct
-		}
-	}
-	return nil
-}
-
-// discoverMissingCatalogs 为「目录未知或已过期」的健康账号补一次模型发现。
-//
-// 只在聊天挑号失败时调用（不是热路径），且有 CatalogTTL 与失败退避兜底：
-// 刚发现过的账号不会被重复打，上游某一路挂了也不会每次请求都空等超时。
-func (h *Handler) discoverMissingCatalogs(tried map[string]bool) {
-	for _, acct := range h.cfg.Pool.Accounts() {
-		if acct == nil || acct.Auth == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
-			continue
-		}
-		if !upstream.AccountCatalogStale(acct.UID) {
-			continue
-		}
-		if _, err := h.cfg.Upstream.FetchModels(acct.Auth); err != nil {
-			log.Printf("lazy model discovery failed for account %s: %v", acct.Name, err)
-		}
-	}
-}
-
-// accountCanServe 报告账号目录里是否登记了该模型；账号不存在或目录未知时乐观放行
-// （交给上游判定，不凭缺失的目录拒请求）。
-func (h *Handler) accountCanServe(acct *pool.Account, model string) bool {
-	if acct == nil {
-		return true
-	}
-	models, known := upstream.AccountModels(acct.UID)
-	if !known {
-		return true
-	}
-	return catalogHas(models, strings.ToLower(upstream.CanonicalModel(model)))
-}
-
-// catalogHas 按小写 ID 在模型目录里查模型。
-func catalogHas(models []upstream.ModelInfo, wantLower string) bool {
-	for _, mi := range models {
-		if strings.ToLower(mi.ID) == wantLower {
-			return true
-		}
-	}
-	return false
-}
-
 // ---------------------------------------------------------------------------
 // chat
 // ---------------------------------------------------------------------------
@@ -700,7 +616,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		stickyAcct = h.convAcct[req.ConversationID]
 		h.convMu.Unlock()
 	}
-	msgs := buildUpstreamMessages(req, toolsOn)
+	msgs := buildUpstreamMessages(req)
 
 	// 已经确认「所有健康账号都用不了这个模型」时直接快速失败：不必再打上游、
 	// 也不必把账号轮转一遍（轮转只会拿到同样的 not registered / benefit not found）。
@@ -712,6 +628,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	// attempted/modelOnlyFailure：区分「试过但每个账号都说没这个模型」（→404）
+	// 与「账号整体不可用」（→503）。删除目录选择器后，轮转本身就是能力探测：
+	// 只有所有被尝试的账号都返回 model-unavailable 才算模型不可用。
+	attempted, modelOnlyFailure := false, true
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *pool.Account
 		if stickyAcct != "" {
@@ -738,15 +658,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("account %s concurrent limit reached after wait, trying next", acct.Name)
 			continue
 		}
+		// holding 记录本请求此刻是否真持有该账号的槽位；所有释放都走 release()。
+		// 之前「先 ReleaseLock、再 AcquireLockWait 失败」的路径会走到第二次
+		// ReleaseLock，把当时另一个在途请求的计数一起减掉 → 并发上限失效。
+		holding := true
+		release := func() {
+			if holding {
+				h.cfg.Pool.ReleaseLock(acct.Name)
+				holding = false
+			}
+		}
 
 		ok, verr := h.cfg.Pool.Validate(acct)
 		if verr == nil && !ok {
-			h.cfg.Pool.ReleaseLock(acct.Name)
+			release()
 			lastErr = errors.New("token invalid")
 			continue
 		}
 		if verr != nil {
-			h.cfg.Pool.ReleaseLock(acct.Name)
+			release()
 			lastErr = verr
 			continue
 		}
@@ -776,8 +706,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			Tools:           tools,
 			ToolChoice:      nativeToolChoice(req.ToolChoice),
 		}
-		// 上游并发会话/TPM 排队是瞬时的。对齐 CodeArts Agent IDE
-		// 参考实现：默认每 10s 重试同一账号，最多 180 次（30min）。
+		// 上游并发会话/TPM 排队是瞬时的：在同一账号上按 QueueRetryDelay
+		// 重试，最多 QueueMaxAttempts 次（默认 10s×30 ≈ 5 分钟，见 config）。
 		// 等待期间释放并发锁，让排队的请求也能尝试（避免死锁式串行等待）。
 		var rc io.ReadCloser
 		var serr error
@@ -809,7 +739,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
 				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
 				// 释放锁让其他请求有机会，等待后重新获取
-				h.cfg.Pool.ReleaseLock(acct.Name)
+				release()
 				select {
 				case <-time.After(h.cfg.QueueRetryDelay):
 				case <-r.Context().Done():
@@ -818,28 +748,37 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				if !h.cfg.Pool.AcquireLockWait(acct.Name, 30*time.Second) {
 					lastErr = errors.New("concurrent limit: could not reacquire lock after wait")
-					break
+					break // 未重新持有槽位：下面不得再 release
 				}
+				holding = true
 				continue
 			}
 			break // 非并发错误，跳出重试
 		}
 		if serr != nil {
-			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
-			if isParamInvalidError(serr) {
+			release() // 释放槽位再换号
+			if isClientGone(r, serr) {
+				// 客户端在连接/首帧阶段就断开了（用户点停止、网关超时）：
+				// 上游错误只是 context canceled 的转述，不是账号故障。
+				log.Printf("chat stream account=%s aborted by client: %v", acct.Name, serr)
+				return
+			}
+			lastErr = serr
+			switch h.handleUpstreamError(acct, model, serr) {
+			case errClientParam:
 				// Client request-param problem: rotating accounts yields the same 400,
 				// and cooling accounts takes down the whole pool for minutes.
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
 				return
+			case errModelUnavailable:
+				// 这个账号没注册/没资格用该模型：换下一个账号试试
+				// （多账号池里模型注册与套餐并不一致）。
+				attempted = true
+				continue
 			}
-			lastErr = serr
-			if h.handleUpstreamError(acct, model, serr) {
-				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
-				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
-					"model "+model+" is not available: "+truncateMsg(serr.Error(), 200))
-				return
-			}
+			attempted = true
+			modelOnlyFailure = false
 			continue
 		}
 		// 真实调用成功：记下「这个账号能用这个模型」，供 /v1/models 过滤参考。
@@ -855,25 +794,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			h.convMu.Lock()
 			h.chats[acct.Name] = chatID
-			h.convAcct[req.ConversationID] = acct.Name // 黏性路由：续接锁定同账号
+			h.rememberConvLocked(req.ConversationID, acct.Name)
 			h.convMu.Unlock()
 			h.saveChats()
 		}
 		if req.Stream {
-			var usage func(*upstream.RawCompletion) map[string]any
-			if req.IncludeUsage {
-				usage = func(comp *upstream.RawCompletion) map[string]any { return usageEstimate(msgs, comp) }
-			}
-			werr := upstream.StreamCaptureWithUsage(w, rc, model, func(comp *upstream.RawCompletion) {
+			werr := upstream.StreamCapture(w, rc, model, req.IncludeUsage, func(comp *upstream.RawCompletion) {
 				storeChat()
 				// 流式传输中定期保活
 				h.cfg.Pool.PingKeepalive(acct.Name)
-			}, usage)
+			})
 			rc.Close()
-			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
+			release()
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-				if !isParamInvalidError(werr) {
+				switch {
+				case isClientGone(r, werr):
+					// 用户点「停止」/网关断连：不是账号的错，不计错误、不冷却。
+					log.Printf("chat stream account=%s aborted by client", acct.Name)
+				case isParamInvalidError(werr):
+					// 客户端参数问题：换号也是同样 400。
+				default:
 					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 				}
 			} else {
@@ -884,15 +825,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		comp, aerr := upstream.AggregateRaw(rc)
 		rc.Close()
-		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
+		release()
 		if aerr != nil {
-			if isParamInvalidError(aerr) {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
+			if isClientGone(r, aerr) {
+				// 客户端已断开：响应无处可写，更重要的是不能因此冷却健康账号。
+				log.Printf("chat account=%s aborted by client: %v", acct.Name, aerr)
 				return
 			}
 			lastErr = aerr
-			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, aerr.Error())
+			// 统一走错误分类：此前这里无条件 Cooldown，把「模型未注册」这类
+			// 账号能力问题当成账号故障，健康账号被冷却 10 分钟。
+			switch h.handleUpstreamError(acct, model, aerr) {
+			case errClientParam:
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
+				return
+			case errModelUnavailable:
+				attempted = true
+				continue
+			}
+			attempted = true
+			modelOnlyFailure = false
 			continue
 		}
 
@@ -915,7 +868,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		storeChat()
 		h.cfg.Pool.NoteSuccess(acct.Name)
 
-		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
+		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, comp.Usage))
+		return
+	}
+	if attempted && modelOnlyFailure {
+		// 每个被尝试的账号都说「没有这个模型」：这才是真正的模型不可用。
+		msg := "model " + model + " is not available"
+		if lastErr != nil {
+			msg += ": " + truncateMsg(lastErr.Error(), 200)
+		}
+		writeOpenAIError(w, http.StatusNotFound, "model_not_available", msg)
 		return
 	}
 	msg := "all accounts unavailable (disabled/cooldown)"
@@ -927,8 +889,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // buildUpstreamMessages 把 OpenAI 消息原生映射为 CodeArts V2 chat-completions。
 // Chat-Id/Session-Id 只做亲和与缓存；多轮语义仍由完整 messages 承载。
-func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessage {
-	_ = toolsOn // 保留参数以稳定内部调用面；工具 schema 由 ChatOptions 原生传递。
+// 工具 schema 由 ChatOptions 原生传递，因此这里不需要 toolsOn 分支。
+func buildUpstreamMessages(req *chatRequest) []upstream.ChatMessage {
 	keepCalls, keepResults := pairedToolMessages(req.Messages)
 	out := make([]upstream.ChatMessage, 0, len(req.Messages))
 	for i, m := range req.Messages {
@@ -1049,22 +1011,21 @@ func fromUpstreamToolCalls(calls []upstream.ChatToolCall) []openAIToolCall {
 	return out
 }
 
-func usageEstimate(msgs []upstream.ChatMessage, comp *upstream.RawCompletion) map[string]any {
-	if comp.Usage != nil {
-		return comp.Usage
+// isClientGone 判断错误是否源自「客户端已断开/取消」，而不是上游故障。
+//
+// 依据请求上下文（Go 在客户端断连时必然取消它）与典型取消错误双保险：
+// 这类错误既不能触发账号冷却（会把健康账号打停），也不值得继续轮转换号。
+func isClientGone(r *http.Request, err error) bool {
+	if r != nil && r.Context().Err() != nil {
+		return true
 	}
-	var pt int
-	for _, m := range msgs {
-		switch content := m.Content.(type) {
-		case string:
-			pt += len([]rune(content))/4 + 1
-		default:
-			raw, _ := json.Marshal(content)
-			pt += len([]rune(string(raw)))/4 + 1
-		}
+	if err == nil {
+		return false
 	}
-	ct := (len([]rune(comp.Content))+len([]rune(comp.Reasoning)))/4 + 1
-	return map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "context canceled")
 }
 
 // buildCompletion 组装非流式响应。
@@ -1097,12 +1058,23 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 	return resp
 }
 
-// handleUpstreamError 记录错误并决定是否处罚账号。
-// 返回 true 表示这是「模型对这个账号不可用」的模型级错误：调用方应立即结束
-// 轮转并向客户端返回明确错误（换账号也是同样的结果）。
-func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) bool {
+// upstreamErrClass 上游错误在轮转里的处置方式。
+type upstreamErrClass int
+
+const (
+	// errRetry 账号级故障（已记录/冷却），换下一个账号继续。
+	errRetry upstreamErrClass = iota
+	// errModelUnavailable 该账号用不了这个模型：不是账号故障，但换账号可能成功
+	// （多账号池的模型注册/套餐不同），所以继续轮转，全部失败才回 404。
+	errModelUnavailable
+	// errClientParam 客户端请求参数问题：换账号同样是 400。
+	errClientParam
+)
+
+// handleUpstreamError 记录错误并给出轮转处置。
+func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) upstreamErrClass {
 	if isParamInvalidError(err) {
-		return false
+		return errClientParam
 	}
 	var ae *upstream.ApiError
 	if errors.As(err, &ae) {
@@ -1113,7 +1085,7 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 		if reason := upstreamUnavailableReason(err); reason != "" {
 			markUnusable(acct.UID, model, reason)
 			log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
-			return true
+			return errModelUnavailable
 		}
 		switch {
 		case ae.Status == 401 || ae.Code == 401:
@@ -1129,10 +1101,10 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 		default:
 			h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 		}
-		return false
+		return errRetry
 	}
 	h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-	return false
+	return errRetry
 }
 
 // isParamInvalidError 判断是否为上游「请求参数无效」类错误（InferHub.001001005）。
@@ -1176,10 +1148,7 @@ func isQueueLimitError(err *upstream.ApiError) bool {
 }
 
 func truncateMsg(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
+	return upstream.TruncateUTF8(s, n)
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,9 +1207,45 @@ func (h *Handler) saveChats() {
 	if h.cfg.ConvStateFile == "" {
 		return
 	}
-	raw, _ := json.MarshalIndent(h.chats, "", "  ")
-	if err := os.WriteFile(h.cfg.ConvStateFile+".tmp", raw, 0o600); err != nil {
+	// 先加锁拍快照，再在锁外序列化：json.MarshalIndent 会遍历 map，
+	// 若与并发请求的写入重叠，Go 直接 fatal（concurrent map iteration and map write）。
+	h.convMu.Lock()
+	snap := make(map[string]string, len(h.chats))
+	for k, v := range h.chats {
+		snap[k] = v
+	}
+	h.convMu.Unlock()
+
+	raw, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		log.Printf("save chats: marshal: %v", err)
 		return
 	}
-	_ = os.Rename(h.cfg.ConvStateFile+".tmp", h.cfg.ConvStateFile)
+	// 并发请求会同时进来，串行化避免两个 goroutine 写同一个 .tmp。
+	h.convFileMu.Lock()
+	defer h.convFileMu.Unlock()
+	tmp := h.cfg.ConvStateFile + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		log.Printf("save chats: write %s: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, h.cfg.ConvStateFile); err != nil {
+		log.Printf("save chats: rename %s: %v", h.cfg.ConvStateFile, err)
+	}
+}
+
+// rememberConvLocked 写入黏性路由表并限制其大小（调用方须持有 convMu）。
+func (h *Handler) rememberConvLocked(convID, account string) {
+	if convID == "" {
+		return
+	}
+	h.convAcct[convID] = account
+	h.convOrder = append(h.convOrder, convID)
+	for len(h.convAcct) > maxConvAcct && len(h.convOrder) > 0 {
+		oldest := h.convOrder[0]
+		h.convOrder = h.convOrder[1:]
+		if _, still := h.convAcct[oldest]; still && oldest != convID {
+			delete(h.convAcct, oldest)
+		}
+	}
 }

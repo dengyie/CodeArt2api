@@ -15,7 +15,7 @@ func TestBuildUpstreamMessagesNewChat(t *testing.T) {
 			{Role: "user", Text: "again"},
 		},
 	}
-	msgs := buildUpstreamMessages(req, false)
+	msgs := buildUpstreamMessages(req)
 	if len(msgs) != 4 {
 		t.Fatalf("msgs=%d", len(msgs))
 	}
@@ -32,7 +32,7 @@ func TestBuildUpstreamMessagesContinueChat(t *testing.T) {
 			{Role: "user", Text: "again"},
 		},
 	}
-	msgs := buildUpstreamMessages(req, false)
+	msgs := buildUpstreamMessages(req)
 	if len(msgs) != 3 {
 		t.Fatalf("msgs=%d", len(msgs))
 	}
@@ -51,7 +51,7 @@ func TestBuildUpstreamMessagesContinueToolTurnReplaysStatelessHistory(t *testing
 			{Role: "tool", ToolCallID: "call_1", Name: "bash", Text: "/workspace"},
 		},
 	}
-	msgs := buildUpstreamMessages(req, true)
+	msgs := buildUpstreamMessages(req)
 	if len(msgs) != 4 {
 		t.Fatalf("msgs=%d", len(msgs))
 	}
@@ -76,7 +76,7 @@ func TestBuildUpstreamMessagesDropsIncompleteToolBatch(t *testing.T) {
 		{Role: "tool", ToolCallID: "call_1", Text: "partial"},
 		{Role: "user", Text: "continue"},
 	}}
-	msgs := buildUpstreamMessages(req, true)
+	msgs := buildUpstreamMessages(req)
 	if len(msgs) != 3 {
 		t.Fatalf("orphan tool result should be dropped: %#v", msgs)
 	}

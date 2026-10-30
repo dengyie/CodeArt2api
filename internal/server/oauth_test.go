@@ -274,37 +274,38 @@ func TestCodeSessionMatchesBySecret(t *testing.T) {
 	st.put(&oauthSession{ID: "s-new", TicketID: "t-new", Secret: "secret-new", Verifier: "v-new", CreatedAt: now})
 
 	// 1) secret 命中（portal 实际行为：回调不带 ticket_id）
-	got := st.codeSession("", "secret-new")
+	cands := st.codeSessionCandidates("", "secret-new")
+	got := firstCandidate(cands)
 	if got == nil || got.ID != "s-new" {
 		t.Fatalf("应按 secret 命中 s-new，got=%v", got)
 	}
 
 	// 2) 带了 secret 但匹配不上 → 不得回退到唯一/其它会话
-	if got := st.codeSession("", "secret-from-restarted-server"); got != nil {
+	if got := firstCandidate(st.codeSessionCandidates("", "secret-from-restarted-server")); got != nil {
 		t.Fatalf("secret 匹配不上时必须放弃，got=%v(verifier=%s)", got, got.Verifier)
 	}
 
 	// 3) 无 secret 时用 ticket_id
-	if got := st.codeSession("t-old", ""); got == nil || got.ID != "s-old" {
+	if got := firstCandidate(st.codeSessionCandidates("t-old", "")); got == nil || got.ID != "s-old" {
 		t.Fatalf("应按 ticket_id 命中 s-old，got=%v", got)
 	}
 
 	// 4) 两者都没有且只有一个活跃会话 → 兜底
 	st2 := newOAuthStore()
 	st2.put(&oauthSession{ID: "only", Secret: "s1", CreatedAt: now})
-	if got := st2.codeSession("", ""); got == nil || got.ID != "only" {
+	if got := firstCandidate(st2.codeSessionCandidates("", "")); got == nil || got.ID != "only" {
 		t.Fatalf("唯一会话应兜底命中，got=%v", got)
 	}
 
 	// 5) 多个会话且无任何匹配键：portal 只回传 code（实测 has_secret=false），
 	//    所以返回全部候选、由调用方逐个尝试，而不是猜一个（旧行为会错配 verifier）。
 	st2.put(&oauthSession{ID: "second", Secret: "s2", CreatedAt: now.Add(time.Second)})
-	cands := st2.codeSessionCandidates("", "")
-	if len(cands) != 2 {
-		t.Fatalf("应返回 2 个候选，got=%d", len(cands))
+	multi := st2.codeSessionCandidates("", "")
+	if len(multi) != 2 {
+		t.Fatalf("应返回 2 个候选，got=%d", len(multi))
 	}
-	if cands[0].ID != "second" {
-		t.Errorf("候选应按创建时间倒序（最新的优先），got[0]=%s", cands[0].ID)
+	if multi[0].ID != "second" {
+		t.Errorf("候选应按创建时间倒序（最新的优先），got[0]=%s", multi[0].ID)
 	}
 	// 已完成的会话不得再作为候选
 	st2.complete("second")
@@ -348,9 +349,19 @@ func TestOAuthCallbackTriesAllCandidateSessions(t *testing.T) {
 
 	// 最新会话的 verifier 是错的（旧实现会直接挑它 → STS5.1805），
 	// 真正能换到凭证的那个会话更早。新实现逐个尝试后应能成功。
+	// DPoP 私钥与真实会话一致（adminOAuthStart 必定生成）：缺它的凭证无法续期，
+	// 保存会被拒绝。
 	now := time.Now()
-	h.oauth.put(&oauthSession{ID: "sb", TicketID: "tb", Secret: "sb-secret", Verifier: goodVerifier, CreatedAt: now.Add(-2 * time.Minute)})
-	h.oauth.put(&oauthSession{ID: "sc", TicketID: "tc", Secret: "sc-secret", Verifier: "wrong-newest", CreatedAt: now.Add(-time.Minute)})
+	keyB, err := upstream.NewDPoPPrivateJWK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyC, err := upstream.NewDPoPPrivateJWK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.oauth.put(&oauthSession{ID: "sb", TicketID: "tb", Secret: "sb-secret", Verifier: goodVerifier, DPoPPrivateKey: keyB, CreatedAt: now.Add(-2 * time.Minute)})
+	h.oauth.put(&oauthSession{ID: "sc", TicketID: "tc", Secret: "sc-secret", Verifier: "wrong-newest", DPoPPrivateKey: keyC, CreatedAt: now.Add(-time.Minute)})
 
 	// portal 实测只回传 code，没有 secret / ticket_id
 	req := httptest.NewRequest(http.MethodGet, "/oauth/callback?code=THE_CODE", nil)
@@ -366,4 +377,12 @@ func TestOAuthCallbackTriesAllCandidateSessions(t *testing.T) {
 	if _, err := auth.LoadDir(authDir); err != nil {
 		t.Fatalf("凭证应已落盘: %v", err)
 	}
+}
+
+// firstCandidate 取候选列表首位（测试断言用；生产路径是逐个尝试）。
+func firstCandidate(list []*oauthSession) *oauthSession {
+	if len(list) == 0 {
+		return nil
+	}
+	return list[0]
 }

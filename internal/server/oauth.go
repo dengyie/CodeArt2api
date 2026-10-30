@@ -144,14 +144,6 @@ func (s *oauthStore) codeSessionCandidates(ticketID, secret string) []*oauthSess
 	return out
 }
 
-// codeSession 返回最可能的单个会话（兼容旧调用与测试）。
-func (s *oauthStore) codeSession(ticketID, secret string) *oauthSession {
-	if c := s.codeSessionCandidates(ticketID, secret); len(c) > 0 {
-		return c[0]
-	}
-	return nil
-}
-
 func (s *oauthStore) del(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -293,7 +285,7 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if err := h.saveLoginResult(tok, sess.Verifier); err != nil {
+	if err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey); err != nil {
 		sess.Done = true
 		sess.Err = err.Error()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": "error", "message": err.Error()})
