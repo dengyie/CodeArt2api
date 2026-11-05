@@ -686,6 +686,18 @@ func (p *Pool) RefreshToken(name string) error {
 	); err != nil {
 		return fmt.Errorf("save token: %w", err)
 	}
+	if resp.RefreshToken == "" {
+		// refresh_token 是一次性的：旧值在本次刷新中已被上游消费，UpdateCredentials
+		// 又会保留旧值。若响应缺新值，账号下次刷新必然报 "the refresh token has been
+		// used" 死循环且不会被标记，这里显式禁用并要求重新登录。
+		acct.mu.Lock()
+		acct.disabled = true
+		acct.disabledReason = "refresh response missing refresh_token; re-login required"
+		acct.lastErr = acct.disabledReason
+		acct.mu.Unlock()
+		log.Printf("pool refresh response missing refresh_token account=%s — disabled, re-login required", name)
+		return fmt.Errorf("refresh response missing refresh_token; re-login required")
+	}
 	acct.mu.Lock()
 	acct.disabled = false
 	acct.disabledReason = ""

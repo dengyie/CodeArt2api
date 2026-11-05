@@ -2,6 +2,9 @@
 
 > 华为云 CodeArts Agent（盘古助手/码道）的 OpenAI 兼容代理。**无需运行 CodeArts Agent
 > 客户端**，纯 Go 直连华为云 API，多账号轮转 + token 自动续期 + WebUI。
+>
+> **免责声明**：本项目基于公开客户端协议的逆向研究，仅供学习与个人研究使用，不承诺
+> 可用性；自动化调用可能违反华为云服务条款，由此产生的账号风险与责任由使用者自行承担。
 
 ## 本仓库来源与差异
 
@@ -187,7 +190,7 @@ docker compose up -d --build
 | `CA2A_WATCH_POLL_MINUTES` | 轮询间隔（分钟） | `30` |
 | `CA2A_WATCH_REFRESH_SKEW` | 提前刷新时间（分钟） | `30` |
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
-| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
+| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `1` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
@@ -205,8 +208,7 @@ internal/auth/     auth 文件读写
 internal/upstream/ 云端客户端（登录/聊天/SSE/模型发现）+ 逆向常量
 internal/pool/     账号池（token 校验/自动刷新/冷却/并发控制）
 internal/scheduler/ token 续期看门狗（新增保活机制）
-internal/server/   OpenAI 兼容路由
-internal/webui/    内嵌 WebUI 控制台
+internal/server/   OpenAI 兼容路由 + 内嵌 WebUI 控制台（panel.html）
 deploy/            systemd unit 样例
 docs/              逆向过程与接口清单
 ```
